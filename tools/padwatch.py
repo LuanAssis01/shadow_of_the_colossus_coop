@@ -14,6 +14,8 @@ from hook import PAD_STATE, PAD_STICK_OFFSET
 
 
 def connect(slot):
+    if os.name == "nt":
+        return pine.Pine(int(slot))
     path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid()),
                         ".flatpak/net.pcsx2.PCSX2/xdg-run/pcsx2.sock" + ("." + slot if slot != "28011" else ""))
     return pine.Pine(path)

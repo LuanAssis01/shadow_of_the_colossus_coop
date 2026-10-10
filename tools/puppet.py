@@ -44,10 +44,11 @@ JR_RA, NOP = 0x03E00008, 0x00000000
 
 PUPPET_SCRIPT = 0x000F3000      # one script per slot, PUPPET_SCRIPT_SIZE apart
 PUPPET_SCRIPT_SIZE = 0x200
-PUPPET_RESTART_INFO = 0x000F3800  # {0, entry} per slot, 8 bytes apart
+PUPPET_RESTART_INFO = 0x000F4000  # {0, entry} per slot, 8 bytes apart
 PUPPET_STATE = 0x000F8200       # one state block per slot
 STATE_SIZE = 0x40
-MAX_SLOTS = 4
+MAX_SLOTS = 8                   # puppet slots 0..3: Wander clones, 4..7: horse clones
+HORSE_SLOT = 4
 MB_CLONES = 0x70                # spawn.py stores the player clone first
 CLONE_STRIDE = 0x20             # clone k: MB_CLONES + k * CLONE_STRIDE (same as spawn.py)
 
@@ -71,6 +72,12 @@ POSITION_FIELDS = (0xA0, 0xB0, 0xD0, 0x550, 0x560, 0x590, 0x1140, 0x11E0)
 def clone_address(p, slot):
     """Player object of clone `slot` (0 when that clone was not spawned)."""
     return p.read32(MAILBOX + MB_CLONES + CLONE_STRIDE * slot)
+
+
+def horse_address(p, k):
+    """Horse object of horse clone `k` (0 when it was not spawned)."""
+    from spawn import MB_HORSES, HORSE_STRIDE
+    return p.read32(MAILBOX + MB_HORSES + HORSE_STRIDE * k)
 
 
 def script_address(slot):
@@ -190,6 +197,15 @@ def make_puppet(p, clone, slot=0, timeout=5.0):
     sc = clone + SC
     if p.read32(sc + SC_ENTRY) == script_address(slot) and not p.read32(sc + SC_RESTART):
         return  # already the puppet; restarting a running coroutine hangs the game's logic
+    # A freshly spawned clone's coroutine must have started (run state 0x101) and run a couple of frames
+    # before its restart is requested; requesting it earlier froze the game logic a few spawns later
+    # (reproduced: spawn + immediate puppet, after a death/retry, froze on the 2nd-4th cycle).
+    end = time.time() + timeout
+    while p.read32(sc + SC_STATE) != 0x101:
+        if time.time() > end:
+            raise TimeoutError("clone's script never started")
+        time.sleep(0.02)
+    wait_frames(p, 3)
     write_state(p, slot)  # flags 0: hold still until the first sample
     originals = {fn: (p.read32(fn), p.read32(fn + 4)) for fn in (RESET_CHARACTER_OBJ, CALL_LAYOUT_OBJ_DEBUG_RESET)}
     assert all(w[0] != JR_RA for w in originals.values()), "resets are currently patched out"
@@ -204,6 +220,17 @@ def make_puppet(p, clone, slot=0, timeout=5.0):
         if time.time() > end:
             raise TimeoutError("script executor did not restart the clone's script")
         time.sleep(0.02)
+    wait_frames(p, 2)
+
+
+def wait_frames(p, n, timeout=5.0):
+    """Let the game's logic run n frames (hook counter)."""
+    start = p.read32(MAILBOX)
+    end = time.time() + timeout
+    while (p.read32(MAILBOX) - start) & 0xFFFFFFFF < n:
+        if time.time() > end:
+            raise TimeoutError("game logic is not running")
+        time.sleep(0.01)
 
 
 if __name__ == "__main__":

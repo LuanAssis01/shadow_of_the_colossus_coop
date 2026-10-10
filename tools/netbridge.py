@@ -31,15 +31,23 @@ import struct
 import sys
 import time
 
-from hook import MAILBOX
-from pine import Pine
+from hook import MAILBOX, SITES, install as install_hook, is_our_jal, counters
+from pine import Pine, PineError
+import guard
 from pad import release as pad_release
 from pad import set_pad
-from puppet import MB_CLONES, clone_address, make_puppet, write_state
+from puppet import HORSE_SLOT, MB_CLONES, clone_address, horse_address, make_puppet, write_state
 
 PLAYER_OBJ_HANDLE_GROUP = 0x01465940   # group whose first object is the player
 RATE = 30.0
 PACKET = struct.Struct("<IIf3f4fI")
+# Appended on the wire only: the sender's horse. flags bit0 = a horse exists, then the same sample fields.
+HORSE = struct.Struct("<IIf3f4f")
+WIRE_SIZE = PACKET.size + HORSE.size
+HORSE_PRESENT = 1
+CLASS_WORD = 0x01206DD8   # +4 of every character object
+PLAYER_HP = 0x012DE264    # current HP (float, 100 = full)
+HEAP_FREE = 0x001E0BF0    # free bytes of the game's main heap (~380 KB at the shrine; a Wander clone costs 62 KB, a horse 43 KB)
 MOTION_STRIDE = 0xDC
 MOTION_TABLE_MAX = 4096
 CLASS = 0x90
@@ -50,6 +58,55 @@ def local_player(p):
     from chars import find_chars
     clones = {clone_address(p, i) for i in range(4)}
     return next(x for x, kind, _pos in find_chars(p) if kind == 2 and x not in clones)
+
+
+def valid_char(p, obj, kind):
+    """True while obj still is a live character object of the given kind (stage reloads free them)."""
+    if not obj or obj & 3 or not 0x100000 <= obj < 0x2000000:
+        return False
+    try:
+        word, k = p.read32_many([obj + 4, obj + CLASS + 0x370])
+    except Exception:
+        return False
+    return word == CLASS_WORD and (k & 0xFFFF) == kind
+
+
+def local_horse(p):
+    """The player's own horse: the kind-3 character that is not one of our horse clones (None if absent)."""
+    from chars import find_chars
+    clones = {horse_address(p, i) for i in range(4)}
+    return next((x for x, kind, _pos in find_chars(p) if kind == 3 and x not in clones), None)
+
+
+class Local:
+    """The local Wander and horse; re-resolves them when a stage reload frees the objects."""
+
+    def __init__(self, p, player):
+        self.p, self.player, self.horse, self.next_horse_scan = p, player, None, 0.0
+
+    def sample(self):
+        """(wander sample, horse sample or None); samples are (motion index, frame, pos, quat)."""
+        p = self.p
+        if not valid_char(p, self.player, 2) or p.readf(PLAYER_HP) <= 0:
+            raise PlayerGone()
+        horse = None
+        if self.horse is not None and not valid_char(p, self.horse, 3):
+            self.horse = None
+        if self.horse is None and time.time() >= self.next_horse_scan:
+            self.next_horse_scan = time.time() + 2.0
+            self.horse = local_horse(p)
+        if self.horse is not None:
+            horse = read_local(p, self.horse)
+        return read_local(p, self.player), horse
+
+
+class PlayerGone(Exception):
+    """The local Wander is dead or was re-created (retry after a death): the clones are untouched, the
+    bridge only stops sending until the new player object exists."""
+
+
+class WorldLost(Exception):
+    """The stage was reloaded (death, load): every pointer the bridge holds is stale."""
 
 
 def read_local(p, player):
@@ -66,8 +123,15 @@ def read_local(p, player):
     return index, f(frame), (f(x), f(y), f(z)), (f(qx), f(qy), f(qz), f(qw))
 
 
-def pack(seq, index, frame, pos, quat):
-    return PACKET.pack(seq, index, frame, *pos, *quat, 0)
+NO_HORSE = HORSE.pack(0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+
+
+def pack(seq, index, frame, pos, quat, horse=None):
+    wire = PACKET.pack(seq, index, frame, *pos, *quat, 0)
+    if horse is None:
+        return wire + NO_HORSE
+    h_index, h_frame, h_pos, h_quat = horse
+    return wire + HORSE.pack(HORSE_PRESENT, h_index, h_frame, *h_pos, *h_quat)
 
 
 TELEPORT_DISTANCE = float(__import__("os").environ.get("TELEPORT_DISTANCE", "5.0"))
@@ -88,6 +152,36 @@ SETTLE_ERROR = float(__import__("os").environ.get("SETTLE_ERROR", "0.25"))
 SETTLE_PACKETS = 8          # target unmoved for this many packets (~0.27 s) counts as standing still
 _still = {}
 _last_target = {}
+
+
+def apply_remote_horse(p, remotes, index, data):
+    """Drive wander clone `index`'s horse clone from the horse part of a wire packet; park it while the
+    sender has no horse (the clone otherwise stands in the world)."""
+    if len(data) < WIRE_SIZE:
+        return
+    flags, h_index, h_frame, hx, hy, hz, qx, qy, qz, qw = HORSE.unpack(data[PACKET.size:WIRE_SIZE])
+    horse_obj = remotes.horses.get(index)
+    if not horse_obj and flags & HORSE_PRESENT:
+        # spawned lazily: only when the remote player has a horse, retried with a growing pause because a
+        # spawn reads the whole RAM (~1.5 s without updates) and the engine refuses it while our own horse
+        # is not displayable (right after a retry, in places the horse cannot go)
+        due, backoff = remotes.horse_retry.get(index, (0.0, 5.0))
+        if time.time() >= due:
+            if try_spawn_horse(p, index):
+                remotes.horses[index] = horse_address(p, index)
+                remotes.horse_retry.pop(index, None)
+                horse_obj = remotes.horses[index]
+            else:
+                remotes.horse_retry[index] = (time.time() + backoff, min(backoff * 2, 60.0))
+    if not horse_obj:
+        return
+    if flags & HORSE_PRESENT:
+        seq = PACKET.unpack(data[:PACKET.size])[0]
+        remotes.horse_parked.discard(index)
+        apply_remote(p, horse_obj, PACKET.pack(seq, h_index, h_frame, hx, hy, hz, qx, qy, qz, qw, 0), HORSE_SLOT + index)
+    elif index not in remotes.horse_parked:
+        remotes.horse_parked.add(index)
+        park(p, horse_obj, HORSE_SLOT + index)
 
 
 def apply_remote(p, clone, data, slot=0):
@@ -152,6 +246,9 @@ class Remotes:
 
     def __init__(self, p):
         self.slots = [(i, clone_address(p, i)) for i in range(4) if clone_address(p, i)]
+        self.horses = {i: horse_address(p, i) for i, _obj in self.slots if horse_address(p, i)}
+        self.horse_parked = set()
+        self.horse_retry = {}          # slot -> (next attempt time, backoff seconds)
         self.by_pid, self.last_rx, self.parked = {}, {}, set()
 
     def slot_for(self, pid):
@@ -254,9 +351,15 @@ class Scenario:
         self.prev = self.held
 
 
-def tick_loop(p, player, clone, send, recv, duration=None, local=None):
-    """recv() yields (pid, datagram) pairs; every pid gets its own clone/puppet slot."""
-    seq = 0
+_debug_kill = [None]
+_t_start = time.time()
+
+
+def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=None):
+    """recv() yields (pid, datagram) pairs; every pid gets its own clone/puppet slot. Raises WorldLost when
+    the local player dies or the stage reloads (seq_box keeps the sequence number across restarts)."""
+    seq_box = seq_box if seq_box is not None else [0]
+    seq = seq_box[0]
     stats = []
     target = [None]
     end = time.time() + duration if duration else None
@@ -264,12 +367,42 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None):
     next_tick = time.time()
     scenario = Scenario(os.environ["SCENARIO"]) if "SCENARIO" in os.environ else None
     remotes = Remotes(p)
+    mine = Local(p, player)
+    gone_since = None
     tracer = Tracer(os.environ["TRACE"]) if "TRACE" in os.environ else None
+    if _debug_kill[0] is None and "DEBUG_KILL_EVERY" in os.environ:
+        _debug_kill[0] = time.time() + float(os.environ["DEBUG_KILL_EVERY"])
     while True:
+        if _debug_kill[0] and time.time() > _debug_kill[0]:   # test hook: die, to exercise the rebuild
+            _debug_kill[0] = None                           # re-armed by the next tick_loop (next life)
+            p.writef(PLAYER_HP, 0.0)
+        if "DEBUG_UNLOAD_HORSE_AT" in os.environ and time.time() - _t_start > float(os.environ["DEBUG_UNLOAD_HORSE_AT"]):
+            del os.environ["DEBUG_UNLOAD_HORSE_AT"]     # test hook: the engine unloads and reloads the horse segment
+            from hook import call as hook_call
+            print("DEBUG: unloading the horse segment (guard runs: %d)" % p.read32(MAILBOX + guard.MB_GUARD_RUNS), flush=True)
+            hook_call(p, 0x01353BB0, timeout=60.0)          # gStatUnloadHorseChara
+            hook_call(p, 0x01353A98, 0xFFFFFFFF, timeout=60.0)  # gStatLoadHorseChara(-1)
+            print("DEBUG: horse reloaded (guard runs: %d, clone objects deleted: %d)" % guard.counters(p), flush=True)
         if scenario:
             scenario.tick(p)
         if send is not None:
-            send(pack(seq, *(local() if local else read_local(p, player))))
+            try:
+                wander, horse = (local(), None) if local else mine.sample()
+            except PlayerGone:
+                if not gone_since:
+                    gone_since = time.time()
+                    print("local player is dead/reloading: pausing my state (clones stay)", flush=True)
+                debug_auto_retry(p, None)
+                mine.player = reacquire_player(p, mine.player)
+                wander = None
+            else:
+                if gone_since:
+                    print("local player is back after %.1fs" % (time.time() - gone_since), flush=True)
+                    gone_since = None
+                    if "DEBUG_KILL_EVERY" in os.environ:
+                        _debug_kill[0] = time.time() + float(os.environ["DEBUG_KILL_EVERY"])
+            if wander is not None:
+                send(pack(seq, *wander, horse=horse))
         for pid, data in recv():
             slot = remotes.slot_for(pid)
             if slot is None:
@@ -278,10 +411,11 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None):
             if pid in remotes.parked:
                 print("player %d back after %.1fs" % (pid, time.time() - remotes.last_rx[pid]), flush=True)
                 remotes.parked.discard(pid)
-            apply_remote(p, obj, data, index)
+            apply_remote(p, obj, data[:PACKET.size], index)
+            apply_remote_horse(p, remotes, index, data)
             remotes.last_rx[pid] = time.time()
             if index == remotes.slots[0][0]:
-                target[0] = PACKET.unpack(data)
+                target[0] = PACKET.unpack(data[:PACKET.size])
                 if tracer:
                     tracer.sample(p, obj, target[0])
         for pid, last in list(remotes.last_rx.items()):
@@ -289,10 +423,28 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None):
                 index, obj = next(s for s in remotes.slots if s[0] == remotes.by_pid[pid])
                 print("player %d silent for %.1fs: parking clone %d" % (pid, DISCONNECT_SECONDS, index), flush=True)
                 park(p, obj, index)
+                if index in remotes.horses:
+                    park(p, remotes.horses[index], HORSE_SLOT + index)
+                    remotes.horse_parked.add(index)
                 remotes.parked.add(pid)
                 if index == remotes.slots[0][0]:
                     target[0] = None
         seq += 1
+        seq_box[0] = seq
+        if seq % 10 == 0 and clone is None:
+            # the stage guard (guard.py) deletes the clones before the engine unloads/restarts their segments
+            for index, obj in remotes.slots:
+                if not guard.owned(p, obj):
+                    raise WorldLost("clones were deleted for a stage reload")
+                if index in remotes.horses and not guard.owned(p, remotes.horses[index]):
+                    # only the horse's segment was unloaded (e.g. horse sent away): drop that clone, it is
+                    # spawned again by the next packet that shows the remote player with a horse
+                    print("horse clone %d was deleted by the engine" % index, flush=True)
+                    horse = remotes.horses.pop(index)
+                    _last_pos.pop(horse, None)
+                    _last_seq.pop(horse, None)
+                    remotes.horse_parked.discard(index)
+                    remotes.horse_retry[index] = (time.time() + 3.0, 5.0)
         first = remotes.slots[0][1]
         if end and target[0]:
             t = target[0]
@@ -315,14 +467,164 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None):
                 m, t = p.read32_many([obj + CLASS + 0x1C0, obj + CLASS + 0x2AC])
                 line.append("clone%d motion %d pos (%.2f, %.2f, %.2f)" % (
                     index, (m - t) // MOTION_STRIDE, p.readf(obj + 0xA0), p.readf(obj + 0xA4), p.readf(obj + 0xA8)))
-            print("tick %d: %s | player (%.2f, %.2f)" % (seq, " ; ".join(line), p.readf(player + 0xA0), p.readf(player + 0xA8)),
-                  flush=True)
+            print("tick %d: %s | player (%.2f, %.2f) | heap free %d" % (
+                seq, " ; ".join(line), p.readf(mine.player + 0xA0), p.readf(mine.player + 0xA8), p.read32(HEAP_FREE)), flush=True)
         next_tick += period
         delay = next_tick - time.time()
         if delay > 0:
             time.sleep(delay)
         else:
             next_tick = time.time()
+
+
+_reacquire_at = [0.0]
+
+
+def reacquire_player(p, current):
+    """After a death the player object is re-created: pick it up once the world has settled (at most once a
+    second; a full RAM scan is needed to find it). Returns the new player object, or `current` until then."""
+    if time.time() < _reacquire_at[0]:
+        return current
+    _reacquire_at[0] = time.time() + 1.0
+    try:
+        if p.readf(PLAYER_HP) > 0 and world_settled(p):
+            return local_player(p)
+    except (PineError, StopIteration):
+        pass
+    return current
+
+
+def hooks_installed(p):
+    return all(is_our_jal(p.read32(site)) for site, *_rest in SITES.values())
+
+
+def logic_running(p, wait=0.5):
+    before = counters(p)
+    time.sleep(wait)
+    return counters(p)[0] != before[0]
+
+
+STAGE_LOAD_STATE = 0x01465E44   # -1 when no stage load is pending (gcCheckStageLoadFinish)
+PAUSE_FLAGS = 0x0146583C        # PauseGame/ReleaseGame bits (menus, map, game over...)
+NOW_LOADING = 0x01466750        # "now loading" effect shown
+
+
+def world_settled(p):
+    load, pause, loading = p.read32_many([STAGE_LOAD_STATE, PAUSE_FLAGS, NOW_LOADING])
+    return load == 0xFFFFFFFF and pause == 0 and loading == 0
+
+
+def wait_world(p, stable=3.0, quiet=False):
+    """Block until the game is in a playable, stable state: the frame hook runs (installing it again if a
+    reload removed it), the local Wander is alive with HP > 0. Returns the player object."""
+    since, last, announced = None, None, False
+    while True:
+        player = None
+        try:
+            if not hooks_installed(p):
+                install_hook(p)
+            if logic_running(p) and p.readf(PLAYER_HP) > 0 and world_settled(p):
+                player = local_player(p)
+        except (PineError, StopIteration, SystemExit):
+            player = None
+        debug_auto_retry(p, player)
+        if player is not None and player == last:
+            since = since or time.time()
+            if time.time() - since >= stable:
+                return player
+        else:
+            since = None
+        last = player
+        if not announced and not quiet:
+            print("waiting for a playable world...", flush=True)
+            announced = True
+        time.sleep(1.0)
+
+
+wait_world.last_retry = 0.0
+
+
+def debug_auto_retry(p, player):
+    """Test hook (env DEBUG_AUTO_RETRY): answer the game-over menu ("Retry" = confirm bit 0x40) so a
+    scripted death does not wait for a human."""
+    if not os.environ.get("DEBUG_AUTO_RETRY") or player is not None:
+        return
+    try:
+        if p.readf(PLAYER_HP) <= 0 and time.time() - wait_world.last_retry > 4.0:
+            from pad import press
+            press(p, 0x40, 0.3)
+            pad_release(p)
+            wait_world.last_retry = time.time()
+    except PineError:
+        pass
+
+
+def setup_clones(p, count):
+    """Spawn `count` Wander clones with their horses and hand each to a puppet script, parked until the
+    first packet of its player arrives."""
+    from spawn import spawn_wander
+    for k in range(count):
+        spawn_wander(p, k)          # SpawnRefused propagates: run_session waits and tries again
+        adopt(p, clone_address(p, k), k)
+    print("spawned %d clone(s)" % count, flush=True)
+
+
+def adopt(p, obj, slot):
+    """Hand a freshly spawned clone to its puppet script and park it until its player's first sample."""
+    make_puppet(p, obj, slot)
+    p.write(4, obj + CLASS + 0xD90, 3)  # WRITE8: the engine must not re-derive the motion from the pad
+    park(p, obj, slot)
+
+
+def try_spawn_horse(p, k):
+    """Spawn and adopt horse clone k; False when the engine refuses for now (no horse displayable)."""
+    from spawn import SpawnRefused, spawn_horse
+    try:
+        spawn_horse(p, k)
+    except SpawnRefused as exc:
+        print("horse clone %d not possible yet (%s)" % (k, exc), flush=True)
+        return False
+    adopt(p, horse_address(p, k), HORSE_SLOT + k)
+    print("horse clone %d spawned" % k, flush=True)
+    return True
+
+
+def run_session(p, send, recv, duration, local, players):
+    """Run the bridge for `duration` seconds, rebuilding the clones whenever the world is lost (death,
+    stage reload). Survives the emulator being restarted only as far as PINE reconnects."""
+    from spawn import SpawnRefused, despawn_clones
+    end = time.time() + duration if duration else None
+    seq_box = [0]
+    try:
+        while True:
+            try:
+                player = wait_world(p)
+                if end and time.time() > end:
+                    return
+                despawn_clones(p)
+                setup_clones(p, max(1, players - 1))
+                tick_loop(p, player, None, send, recv, (end - time.time()) if end else None, local, seq_box)
+                return
+            except WorldLost as exc:
+                print("world lost (%s): removing clones, waiting to rebuild" % exc, flush=True)
+                try:
+                    before = p.read32(HEAP_FREE)
+                    despawn_clones(p)
+                    time.sleep(1.0)
+                    print("heap free %d -> %d after removing the clones" % (before, p.read32(HEAP_FREE)), flush=True)
+                except (PineError, OSError):
+                    pass
+            except SpawnRefused as exc:
+                print("clone not possible yet (%s): retrying" % exc, flush=True)
+                time.sleep(2.0)
+    finally:
+        # never leave puppets behind: without the bridge they would replay the last state forever
+        try:
+            despawn_clones(p)
+            pad_release(p)
+            print("bridge stopped: clones removed", flush=True)
+        except (PineError, OSError):
+            pass
 
 
 def replay(p, clone, packets, dx, dz):
@@ -388,7 +690,7 @@ def sendfile(path, host, port, loss=0.0, jitter_ms=0.0):
         f[3] += dx
         f[5] += dz
         if random.random() >= loss / 100.0:
-            pending.append((start + i / RATE + random.uniform(0, jitter_ms) / 1000.0, PACKET.pack(*f)))
+            pending.append((start + i / RATE + random.uniform(0, jitter_ms) / 1000.0, PACKET.pack(*f) + NO_HORSE))
         now = time.time()
         for item in [x for x in pending if x[0] <= now]:
             sock.sendto(item[1], (host, port))
@@ -405,17 +707,22 @@ def main():
                  float(sys.argv[5]) if len(sys.argv) > 5 else 0.0, float(sys.argv[6]) if len(sys.argv) > 6 else 0.0)
         return
     p = Pine()
+    live = mode in ("echo", "host", "join", "recv")
     clone = p.read32(MAILBOX + MB_CLONES)
-    if not clone:
+    if not clone and not live:
         raise SystemExit("no clone: run spawn.py first")
-    player = local_player(p)
-    if mode not in ("record", "send"):
+    player = local_player(p) if not live else None
+    if mode not in ("record", "send") and not live:
         for slot in range(4):
             obj = clone_address(p, slot)
             if obj:
                 make_puppet(p, obj, slot)
                 # The engine would re-derive the clone's motion from the (absent) pad; leave it alone.
                 p.write(4, obj + CLASS + 0xD90, 3)  # WRITE8
+            horse = horse_address(p, slot)
+            if horse:
+                make_puppet(p, horse, HORSE_SLOT + slot)
+                p.write(4, horse + CLASS + 0xD90, 3)
 
     if mode == "record":
         out = open(sys.argv[2], "wb")
@@ -442,19 +749,30 @@ def main():
         pending = []
 
         def send(data):
-            fields = list(PACKET.unpack(data))
+            fields = list(PACKET.unpack(data[:PACKET.size]))
             fields[3] += dx
             fields[5] += dz
-            pending.append(PACKET.pack(*fields))
+            horse = list(HORSE.unpack(data[PACKET.size:WIRE_SIZE]))
+            horse[3] += dx
+            horse[5] += dz
+            pending.append(PACKET.pack(*fields) + HORSE.pack(*horse))
 
         def recv():
             out, pending[:] = [(0, d) for d in pending], []
             return out
 
-        tick_loop(p, player, clone, send, recv, float(os.environ["DURATION"]) if "DURATION" in os.environ else None)
+        run_session(p, send, recv, float(os.environ["DURATION"]) if "DURATION" in os.environ else None, None,
+                    int(os.environ.get("PLAYERS", "2")))
         return
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if os.name == "nt":
+        # Windows reports an ICMP "port unreachable" from a vanished peer as a recvfrom error that would
+        # kill the bridge; ask it not to (SIO_UDP_CONNRESET = _WSAIOW(IOC_VENDOR, 12)).
+        import ctypes
+        returned = ctypes.c_ulong(0)
+        ctypes.windll.ws2_32.WSAIoctl(ctypes.c_size_t(sock.fileno()), 0x9800000C, ctypes.byref(ctypes.c_ulong(0)), 4,
+                                      None, 0, ctypes.byref(returned), None, None)
     sock.setblocking(False)
     server = mode in ("host", "recv")      # many peers; each source address gets a player id
     peers = {}                              # server: address -> pid (1, 2, ...)
@@ -475,23 +793,29 @@ def main():
                 data, addr = sock.recvfrom(256)
             except BlockingIOError:
                 return out
-            if len(data) != PACKET.size:
+            if len(data) == PACKET.size:
+                data += NO_HORSE                              # sender without horse support
+            if len(data) != WIRE_SIZE:
                 continue
             if not server:
-                out.append((PACKET.unpack(data)[-1], data))   # the host stamped the origin pid
+                out.append((PACKET.unpack(data[:PACKET.size])[-1], data))   # the host stamped the origin pid
                 continue
             pid = peers.setdefault(addr, len(peers) + 1)
-            fields = list(PACKET.unpack(data))
+            fields = list(PACKET.unpack(data[:PACKET.size]))
             fields[-1] = pid
-            data = PACKET.pack(*fields)
+            data = PACKET.pack(*fields) + data[PACKET.size:]
             for other in peers:               # relay to every other peer
                 if other != addr:
                     sock.sendto(data, other)
             out.append((pid, data))
 
     duration = float(os.environ["DURATION"]) if "DURATION" in os.environ else None
-    tick_loop(p, player, clone, None if mode == "recv" else send, (lambda: []) if mode == "send" else recv, duration,
-              simulated_local() if "SIM" in os.environ else None)
+    send_fn, recv_fn = None if mode == "recv" else send, (lambda: []) if mode == "send" else recv
+    local = simulated_local() if "SIM" in os.environ else None
+    if mode == "send":
+        tick_loop(p, player, clone, send_fn, recv_fn, duration, local)
+    else:
+        run_session(p, send_fn, recv_fn, duration, local, int(os.environ.get("PLAYERS", "2")))
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ v1.00 build.
 
 ## Layout
 
-- `tools/` Python tooling (PINE client, hook installer, spawner, puppet script, UDP bridge, helpers)
+- `tools/` Python tooling (PINE client, hook installer, spawner, puppet script, UDP bridge, stage guard, Windows launcher `coop_local.py`, helpers)
 - `work/scen*.json` input scenarios, `work/walk*.bin` recorded movement samples used by the tests
 
 This is an unofficial fan research project, not affiliated with or endorsed by Sony or the game's

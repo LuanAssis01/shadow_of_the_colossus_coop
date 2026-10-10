@@ -241,3 +241,48 @@ gets a new pid and reuses the parked clone).
 
 Savestates: slot 1 = before any hook; 2 = hook installed, shrine; 4 = hook installed, no clone;
 8 = complete clone (spawn.py) next to the real Wander; 9 = scratch (snap.py).
+
+## Windows setup and session 2026-10-10 (night): horse, deaths, memory
+
+**Windows setup.** PCSX2 2.9.85 serves PINE over TCP (`127.0.0.1:<slot>`, `pine.py` does that on `nt`). It has no
+`-settings` switch, so each instance is a portable copy of the emulator folder: `work/pcsx2_a/emu` and
+`work/pcsx2_b/emu` (each with `portable.txt`, `inis/PCSX2.ini` with `EnablePINE`, slots 28011 / 28012,
+controllers SDL-0 / SDL-1 plus keyboard, instance B muted, savestates/memcards/logs in its own folder).
+`tools/coop_local.py` starts both, loads the clean shrine state (slot 1, saved once with no hook) and runs
+host (B) / client (A); `--stop` closes everything. `socket.ioctl` cannot set SIO_UDP_CONNRESET: `netbridge.py`
+uses `WSAIoctl` through ctypes (without it a peer that vanished kills the other bridge).
+
+**Horse.** The horse is segment `*(0x01465E14)` (0xba): the horse character (kind 3) and a helper object. It is
+cloned like the Wander (`spawn.py horse K`, pointers at mailbox 0x120 + K*0x10) and driven by the same puppet
+script (puppet slots 4..7). The wire packet is now 84 bytes: the 44-byte Wander sample + a horse sample
+(`HORSE`, flag bit0 = the sender has a horse). The horse clone is spawned lazily, when the first packet with a
+horse arrives, and parked when the sender has none.
+
+**Why the game froze after dying (found, fixed).** Not the stage reload: the *game heap is tiny*. `0x1E0BF0` is
+its free-byte counter: ~380 KB free at the shrine, a Wander clone costs ~62 KB and a horse clone ~45 KB, the
+biggest single request is 77 KB (`0x12d14`). The engine has no out-of-memory path for these allocations: a
+failed one either spins forever in `initlayout`'s dependency loop (a child waits for a parent that never
+spawned) or crashes in `initParticleObject` (null +0x108). Deleting the clones when the game restarts the
+player (death at the shrine) and spawning them again lost ~60 KB per cycle until a spawn failed (4th death).
+Fixes: clones now SURVIVE a restart (death at the shrine keeps the segments' assets; 15 deaths in 10 minutes
+tested, heap stable); `spawn.heap_fits()` refuses a spawn unless the free count and a probe block fit
+(`SpawnRefused`, retried later); the spawn routine checks every entry's preconditions before touching anything.
+`guard.py` (EE-side) marks every clone with a delete handler and deletes all clones before
+`stagemanager_unloadstagecore` runs (a real stage unload frees the assets they draw with). Untested: a
+real death in the open field (needs a savestate there); emulating it with `gStatUnloadHorseChara` crashes the
+game for an unrelated reason (the local horse's scripts keep using it).
+
+Useful facts: `isysRequestDeleteObj` (0x001C7548) is the engine's own delete; `iosMallocAlignNoCheck(heap, size,
+align)` returns NULL instead of the recovery path; main heap = 0x001E0C88; `PINE` allows one client, so
+tests that must poke the game while the bridge runs use env hooks (`DEBUG_KILL_EVERY`, `DEBUG_AUTO_RETRY`,
+`DEBUG_UNLOAD_HORSE_AT`). A freeze can be diagnosed from a savestate: extract `PCSX2 Internal Structures.dat`
+(`cpuRegs` tag +32: GPRs, PC) and disassemble `eeMemory.bin`.
+
+**Colossus table** (`warp.py list`): `*(0x0156B440+0x10)` + 0xEC*i, +0x51 area, +0x64 arrival (relative to
+`YattsukeGetSeamlessAreaCenter(area)`, x and z mirrored), +0xBC max HP, +0xC0 max grip. Colossus 0 (Valus)
+arrival = (-305, 3.8, 271.5), reachable on foot in the same coordinate space as the shrine. Teleporting there
+does not stream the terrain in by itself (`warp.py boss N` holds the player in the air for 20 s; not yet verified).
+
+**Next (not done):** boss sync. Plan unchanged (host-authoritative pose: motion index + frame + root transform
+puppeted like the Wander, life merged with min() per part, defeat triggered on both); needs a savestate at a
+colossus first. Also: field-death test, 3+ players, latency/NAT between two machines.

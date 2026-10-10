@@ -14,7 +14,7 @@ import zipfile
 
 from pine import SAVE_STATE, Pine
 
-SSTATES = os.environ.get("SSTATES") or os.path.expanduser("~/.var/app/net.pcsx2.PCSX2/config/PCSX2/sstates")
+SSTATES = os.environ.get("SSTATES") or os.path.expanduser("~/Documents/PCSX2/sstates" if os.name == "nt" else "~/.var/app/net.pcsx2.PCSX2/config/PCSX2/sstates")
 SERIAL = "SCUS-97472 (C19A374E)"
 SCRATCH_SLOT = 9
 

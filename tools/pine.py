@@ -5,11 +5,15 @@ import struct
 
 # PINE_SLOT selects another emulator instance (see work/pcsx2_b: slot 28012 is
 # socket "pcsx2.sock.28012"); the default slot 28011 is plain "pcsx2.sock".
+# On Windows PCSX2 serves PINE over TCP on localhost, port = slot.
 _SLOT = os.environ.get("PINE_SLOT", "")
-DEFAULT_SOCKET = os.path.join(
-    os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid()),
-    ".flatpak/net.pcsx2.PCSX2/xdg-run/pcsx2.sock" + ("." + _SLOT if _SLOT and _SLOT != "28011" else ""),
-)
+if os.name == "nt":
+    DEFAULT_SOCKET = int(_SLOT or 28011)
+else:
+    DEFAULT_SOCKET = os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid()),
+        ".flatpak/net.pcsx2.PCSX2/xdg-run/pcsx2.sock" + ("." + _SLOT if _SLOT and _SLOT != "28011" else ""),
+    )
 
 READ8, READ16, READ32, READ64 = 0, 1, 2, 3
 WRITE8, WRITE16, WRITE32, WRITE64 = 4, 5, 6, 7
@@ -27,8 +31,12 @@ class PineError(RuntimeError):
 
 class Pine:
     def __init__(self, path=DEFAULT_SOCKET):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.connect(path)
+        if isinstance(path, int):
+            self.sock = socket.create_connection(("127.0.0.1", path))
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        else:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.connect(path)
 
     def close(self):
         self.sock.close()
@@ -67,6 +75,12 @@ class Pine:
     def status(self):
         return {0: "running", 1: "paused", 2: "shutdown"}.get(
             struct.unpack("<I", self._call(bytes([STATUS])))[0], "unknown")
+
+    def save_state(self, slot):
+        self._call(struct.pack("<BB", SAVE_STATE, slot))
+
+    def load_state(self, slot):
+        self._call(struct.pack("<BB", LOAD_STATE, slot))
 
     def read(self, opcode, addr):
         data = self._call(struct.pack("<BI", opcode, addr))
