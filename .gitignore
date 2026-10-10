@@ -1,0 +1,30 @@
+# Allow-list: only our own source and notes are tracked. Everything else stays local.
+*
+!*/
+!.gitignore
+!README.md
+!MULTIPLAYER.md
+!tools/*.py
+!tools/dec.sh
+!tools/rea-ps2
+!work/scen*.json
+!work/walk*.bin
+
+# Never track (also covered by the allow-list; listed so they are never re-added by accident):
+# game and console content: *.iso, PS2_bios/, work/extracted, work/dumps, work/scan, savestates,
+#   screenshots (they contain game images), work/symbols.tsv (names pulled from the game binary)
+# third-party software: tools/ghidra_*, tools/rea, tools/dl, tools/cb2util
+# generated files: traces, logs, sockets, __pycache__, work/pcsx2_b (emulator profile with BIOS paths)
+*.iso
+*.bin
+!work/walk*.bin
+PS2_bios/
+work/extracted/
+work/dumps/
+work/scan/
+work/pcsx2_b/
+tools/ghidra_*/
+tools/rea/
+tools/dl/
+tools/cb2util/
+__pycache__/

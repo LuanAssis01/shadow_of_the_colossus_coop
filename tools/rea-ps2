@@ -1,0 +1,5 @@
+#!/bin/sh
+# Runs the (MIPS-patched) REA against the local Ghidra. Both live next to this script (not in git).
+HERE="$(cd "$(dirname "$0")" && pwd)"
+export GHIDRA_INSTALL_DIR="$HERE/ghidra_12.1.4_PUBLIC"
+exec node "$HERE/rea/scripts/rea.mjs" "$@"
