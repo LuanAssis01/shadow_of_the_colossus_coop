@@ -131,7 +131,7 @@ def main():
             "a": open(os.path.join(ROOT, "work", "net_a_win.log"), "w")}
     def bridge_env(name):
         extra = {"PINE_SLOT": str(SLOTS[name])}
-        for key in ("DEBUG_DAMAGE_AT", "DEBUG_KILL_EVERY", "DEBUG_KILL_BOSS_AT", "PULL"):
+        for key in ("DEBUG_DAMAGE_AT", "DEBUG_KILL_EVERY", "DEBUG_KILL_BOSS_AT", "DEBUG_SET_PROGRESS", "PULL"):
             if os.environ.get(key + "_" + name.upper()):
                 extra[key] = os.environ[key + "_" + name.upper()]
         if os.environ.get("SCENARIO_" + name.upper()):          # scripted controller for this instance

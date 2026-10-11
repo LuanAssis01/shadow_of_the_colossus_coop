@@ -50,6 +50,10 @@ WIRE_SIZE = PACKET.size + HORSE.size
 # the pose is authoritative (only the host sets it); motion id, frame, position, rotation, part count, damage, life.
 BOSS = struct.Struct("<IIf3f4fI32ff")     # ... damage[32], life (base+0x44; -1 = unknown)
 FULL_SIZE = WIRE_SIZE + BOSS.size
+# Also appended: the sender's progress (see Progress): active colossus index (-1 unknown) and maximum HP.
+PROGRESS = struct.Struct("<if")
+NET_SIZE = FULL_SIZE + PROGRESS.size
+NO_PROGRESS = PROGRESS.pack(-1, 0.0)
 BOSS_PRESENT, BOSS_AUTH, BOSS_PENDING = 1, 2, 4   # PENDING: my game waits at the start of the encounter (barrier.py)
 # long enough for a far player to be pulled in (Puller: PULL_HOLD) and walk into the trigger
 BARRIER_SECONDS = float(os.environ.get("BOSS_BARRIER_SECONDS", "30"))
@@ -151,14 +155,14 @@ def pack_boss(boss, pending=False):
     return BOSS.pack(flags, mid, frame, *pos, *quat, count, *damage, life)
 
 
-def pack(seq, index, frame, pos, quat, horse=None, boss=None, pending=False):
+def pack(seq, index, frame, pos, quat, horse=None, boss=None, pending=False, progress=None):
     wire = PACKET.pack(seq, index, frame, *pos, *quat, 0)
     if horse is None:
         wire += NO_HORSE
     else:
         h_index, h_frame, h_pos, h_quat = horse
         wire += HORSE.pack(HORSE_PRESENT, h_index, h_frame, *h_pos, *h_quat)
-    return wire + pack_boss(boss, pending)
+    return wire + pack_boss(boss, pending) + (PROGRESS.pack(*progress) if progress else NO_PROGRESS)
 
 
 _boss_seq = [-1]
@@ -190,6 +194,73 @@ def apply_boss(data, pid):
         if seq > _boss_seq[0] or seq + 1000 < _boss_seq[0]:
             _boss_seq[0] = seq
             link.apply_pose(mid, frame, (x, y, z), (qx, qy, qz, qw))
+
+
+class Progress:
+    """Keep the journey shared: a player who is behind (lower active colossus) adopts the peer's progress.
+
+    Forward only, and only while the local game is idle (no cutscene/menu, no colossus fight, not waiting at an
+    encounter start). Adopting = the game's own calls: bossStatSetDeadBoss(record) for every earlier colossus that
+    is still marked alive, bossStatSetActiveBoss(record of the peer's colossus) (layout flags, active index, clear
+    count, its alive flag), and the maximum HP raised to the peer's (+4 per colossus; float game work 0xB at
+    *(0x01465BB0)+0x2C). A player who is ahead does nothing: the other side catches up."""
+
+    MAX_HP_TABLE = 0x01465BB0
+    SET_DEAD_BOSS = 0x0134A378
+    SET_ACTIVE_BOSS = 0x01349518
+    CHK_DEAD_BOSS = 0x0134A3A8            # bossStatChkDeadBoss(record): 1 when its alive flag (record+0x18) is clear
+
+    def __init__(self, p):
+        self.p, self.next_check, self.remote = p, 0.0, None
+
+    def local(self):
+        """(active colossus index, max HP) of this game, or None."""
+        import warp
+        p = self.p
+        try:
+            record = call(p, GET_ACTIVE_BOSS, timeout=1.0)
+        except TimeoutError:
+            return None
+        index = (record - p.read32(warp.BOSS_TABLE + 0x10)) // warp.BOSS_RECORD_SIZE if record else -1
+        return index if 0 <= index < warp.BOSS_COUNT else -1, p.readf(p.read32(self.MAX_HP_TABLE) + 0x2C)
+
+    def observe(self, data):
+        if len(data) >= NET_SIZE:
+            index, max_hp = PROGRESS.unpack(data[FULL_SIZE:NET_SIZE])
+            if index >= 0:
+                self.remote = (index, max_hp)
+
+    def tick(self):
+        """Once every 2 s: returns my (index, max hp) for the wire, adopting the peer's when it is ahead."""
+        now = time.time()
+        if now < self.next_check:
+            return self.cached
+        self.next_check = now + 2.0
+        mine = self.local()
+        self.cached = mine
+        if mine is None or self.remote is None:
+            return mine
+        import warp
+        p, (index, max_hp), (r_index, r_hp) = self.p, mine, self.remote
+        idle = not (p.read32(GAME_MODE_BITS) & 1) and world_settled(p) and not barrier.pending(p) and             not (BOSS_LINK[0] and (BOSS_LINK[0].awake() or BOSS_LINK[0].mirroring()))
+        if not idle:
+            return mine
+        if r_index > index >= 0:
+            for i in range(r_index):
+                record = warp.record(p, i)
+                if not call(p, self.CHK_DEAD_BOSS, record):
+                    call(p, self.SET_DEAD_BOSS, record)
+            call(p, self.SET_ACTIVE_BOSS, warp.record(p, r_index))
+            print("progress: the peer is at colossus %d, I was at %d: caught up" % (r_index, index), flush=True)
+            index = r_index
+        if r_hp > max_hp:
+            p.writef(p.read32(self.MAX_HP_TABLE) + 0x2C, min(r_hp, 570.0))
+            print("progress: max HP %.0f -> %.0f (the peer's)" % (max_hp, r_hp), flush=True)
+            max_hp = r_hp
+        self.cached = (index, max_hp)
+        return self.cached
+
+    cached = None
 
 
 _pull_target = [None]          # (time, position, rotation) of a peer that is at a colossus
@@ -522,6 +593,7 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
     gone_since = None
     tracer = Tracer(os.environ["TRACE"]) if "TRACE" in os.environ else None
     puller = Puller(p) if BOSS_ROLE[0] and local is None else None
+    progress = Progress(p) if BOSS_ROLE[0] and local is None and os.environ.get("PROGRESS_SYNC", "1") != "0" else None
     if _debug_kill[0] is None and "DEBUG_KILL_EVERY" in os.environ:
         _debug_kill[0] = time.time() + float(os.environ["DEBUG_KILL_EVERY"])
     while True:
@@ -547,6 +619,14 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
             else:
                 BOSS_LINK[0].boss.kill()
                 print("DEBUG: local colossus killed", flush=True)
+        if "DEBUG_SET_PROGRESS" in os.environ:          # test hook: "index,max_hp" = this player is further on
+            import warp
+            index, max_hp = os.environ.pop("DEBUG_SET_PROGRESS").split(",")
+            for i in range(int(index)):
+                call(p, Progress.SET_DEAD_BOSS, warp.record(p, i))
+            warp.activate(p, int(index))
+            p.writef(p.read32(Progress.MAX_HP_TABLE) + 0x2C, float(max_hp))
+            print("DEBUG: progress set to colossus %s, max HP %s" % (index, max_hp), flush=True)
         if scenario:
             scenario.tick(p)
         if send is not None:
@@ -578,7 +658,8 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
                         if time.time() - _released_at[0] > 3.0:
                             print("encounter start released together with the peer", flush=True)
                         _released_at[0] = time.time()
-                send(pack(seq, *wander, horse=horse, boss=link.sample() if link else None, pending=waiting))
+                send(pack(seq, *wander, horse=horse, boss=link.sample() if link else None, pending=waiting,
+                          progress=progress.tick() if progress else None))
         for pid, data in recv():
             slot = remotes.slot_for(pid)
             if slot is None:
@@ -590,6 +671,8 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
             apply_remote(p, obj, data[:PACKET.size], index)
             apply_remote_horse(p, remotes, index, data)
             apply_boss(data, pid)
+            if progress:
+                progress.observe(data)
             remotes.last_rx[pid] = time.time()
             if index == remotes.slots[0][0]:
                 target[0] = PACKET.unpack(data[:PACKET.size])
@@ -1008,7 +1091,9 @@ def main():
                 data += NO_HORSE                              # sender without horse support
             if len(data) == WIRE_SIZE:
                 data += NO_BOSS                               # sender without colossus support
-            if len(data) != FULL_SIZE:
+            if len(data) == FULL_SIZE:
+                data += NO_PROGRESS                           # sender without progress support
+            if len(data) != NET_SIZE:
                 continue
             if not server:
                 out.append((PACKET.unpack(data[:PACKET.size])[-1], data))   # the host stamped the origin pid

@@ -400,6 +400,15 @@ the player walks in; with 15 s or 30 s holds (and `forceLoadSeamlessStage` every
 player falls to the kill plane (y -300) and dies. The encounter barrier now waits 30 s (`BOSS_BARRIER_SECONDS`);
 a player arriving later joins the running fight (the pose mirror handles that).
 
+**Progress sync (`netbridge.Progress`, verified).** Packets end with the sender's active colossus index and max HP
+(`PROGRESS`, 268-byte datagram). A player who is behind adopts the peer's progress while idle (no cutscene/menu,
+no fight, not at an encounter start): `bossStatSetDeadBoss` for every earlier colossus still alive
+(`bossStatChkDeadBoss` returns 1 when DEAD), `bossStatSetActiveBoss` for the peer's, max HP raised to the peer's
+(float at `*(0x01465BB0)+0x2C`, cap 570). Forward only; `PROGRESS_SYNC=0` disables it; `DEBUG_SET_PROGRESS=i,hp`
+fakes progress for tests. Test: both from the shrine, B set to colossus 3 / 112 HP -> A caught up within 2 s; both
+report dead 0-2, active 3, the game's own alive search (`bossStatSrhSheetAliveBoss`) -> 3, max HP 112. Not synced:
+the shrine idols / Wander's look (they change at the next stage load), grip, items.
+
 **Any colossus on demand.** `bossStatSetActiveBoss(record)` enables only that colossus' layout (game flags), sets the
 active index (`_gameWork 8`), the clear count and its "alive" flag. `warp.py fight N` = activate + warp;
 `bosstour.py` visits all 16 from a savestate and screenshots each (`work/tour/`). Result (shrine state, 20 s
@@ -435,7 +444,8 @@ Missing / unverified:
 - [ ] Other cutscenes: colossus death/ending/other demos are per machine (no barrier); only the encounter start
       is aligned. Idea: detours on `gameModeSet(1)` / `demoManStart` with the same wait-for-peer barrier.
 - [ ] Answering the post-kill save prompt from scripts (for unattended tests); colossi 7, 10, 13-15 via warp.
-- [ ] World progress sync (game flags `_gameFlagSet/_gameFlagChk`, dead-boss flags, checkpoints, deaths of the
+- [x] Progress catch-up (active colossus, dead flags, max HP), forward only.
+- [ ] Rest of world progress (game flags `_gameFlagSet/_gameFlagChk` in general, checkpoints, grip, the
       colossus on both save files).
 - [ ] 3+ players on one colossus; latency/NAT/VPN test between two real machines; mesh instead of star relay.
 - [ ] The pose is forced every game frame from 30 Hz packets (some stutter expected); interpolation not done.
