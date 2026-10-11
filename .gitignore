@@ -4,6 +4,7 @@
 !.gitignore
 !README.md
 !MULTIPLAYER.md
+!GAME_INTERNALS.md
 !tools/*.py
 !tools/dec.sh
 !tools/rea-ps2
