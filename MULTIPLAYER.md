@@ -328,3 +328,29 @@ State 2 of both instances is a real colossus-0 encounter saved by the user. Find
 * Not done: cutscenes other than the encounter start (death cutscene of the colossus, ending...), pulling the
   other player to the arena, colossus death handled by the merged damage but untested (needs a real kill),
   more than two players on one colossus (pose only from the host / the player whose AI runs it).
+
+
+## STATUS (2026-10-11) - done and missing
+
+Done and verified (two PCSX2 instances on one Windows PC, `python tools/coop_local.py`):
+- [x] Windows setup: portable PCSX2 copies per instance, PINE over TCP, launcher with clean/boss savestates.
+- [x] Second Wander (clone) driven by the remote player, light moves, settle, disconnect parking.
+- [x] Horse clone (visible, synced), lazy spawn, heap-safe spawn (`heap_fits`), delete guard on stage unload.
+- [x] Deaths: clones survive restarts, bridge pauses/resumes (15 deaths in a row, also from the open field).
+- [x] Colossus: pose mirror (motion id + frame + rotation + position) with the local AI running, damage merged
+      with max in both directions, "who runs the AI is in charge" arbitration.
+- [x] Encounter start barrier (BootBoss): both players get the intro cutscene together (or after 15 s).
+- [x] Tools: boss.py, bosssync.py, barrier.py, guard.py, warp.py, probe.py, bosstest.py, coop_local.py.
+
+Missing / unverified:
+- [ ] Verify by eye with two people (pose smoothness, horse, hits on the mirrored colossus register damage,
+      the client takes no phantom hits from its own AI while mirroring).
+- [ ] Colossus death: merged damage should trigger the death sequence on both machines; needs a real kill.
+- [ ] Other cutscenes: colossus death/ending/other demos are per machine (no barrier); only the encounter start
+      is aligned. Idea: detours on `gameModeSet(1)` / `demoManStart` with the same wait-for-peer barrier.
+- [ ] Pull the other player to the arena when one starts an encounter (regroup teleport, needs the terrain-streaming
+      hold trick of `warp.py`).
+- [ ] World progress sync (game flags `_gameFlagSet/_gameFlagChk`, dead-boss flags, checkpoints, deaths of the
+      colossus on both save files).
+- [ ] 3+ players on one colossus; latency/NAT/VPN test between two real machines; mesh instead of star relay.
+- [ ] The pose is forced every game frame from 30 Hz packets (some stutter expected); interpolation not done.
