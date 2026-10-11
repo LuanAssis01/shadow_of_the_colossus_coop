@@ -283,6 +283,20 @@ tests that must poke the game while the bridge runs use env hooks (`DEBUG_KILL_E
 arrival = (-305, 3.8, 271.5), reachable on foot in the same coordinate space as the shrine. Teleporting there
 does not stream the terrain in by itself (`warp.py boss N` holds the player in the air for 20 s; not yet verified).
 
+**Open-field death (tested 2026-10-11).** Savestate 2 (the player at colossus 0's arrival point, made with
+`warp.py boss 0`) + `DEBUG_KILL_EVERY` in the echo bridge: the first death happens in the field, the retry
+reloads the shrine; the clones survive it and the bridge resumes ("local player is back"), 5 deaths, no freeze.
+
+**Colossus recon (`boss.py`, `warp.py`).** `warp.py boss 0` holds the player 25 m above the arrival point for 20 s
+while the terrain streams in, then drops it: it works (collision around the arrival point only; the arena
+behind a wall at z ~ 298 is not reachable by teleport, the player falls through). The colossus object exists
+and is loaded (kind 4, 19 parts, ids 0x160..0x1d0) but is dormant: its AI (`updateScriptDataSystem`
+interpreter) only starts when the game's event script runs `BootBoss` (= `bossStatStartDemo`); setting boot flag 71
+(`_gameFlagSet`) or calling `bossStatStartDemo` by hand does nothing, and life values are 0 until the fight
+starts. Blind navigation with the pad is camera-relative and the first corridor is a dead end, so a real fight
+needs a human-made savestate (walk/ride to the colossus once, save). Time Attack is not reachable (no
+memory card: the game goes straight into the opening).
+
 **Next (not done):** boss sync. Plan unchanged (host-authoritative pose: motion index + frame + root transform
 puppeted like the Wander, life merged with min() per part, defeat triggered on both); needs a savestate at a
 colossus first. Also: field-death test, 3+ players, latency/NAT between two machines.
