@@ -300,3 +300,31 @@ memory card: the game goes straight into the opening).
 **Next (not done):** boss sync. Plan unchanged (host-authoritative pose: motion index + frame + root transform
 puppeted like the Wander, life merged with min() per part, defeat triggered on both); needs a savestate at a
 colossus first. Also: field-death test, 3+ players, latency/NAT between two machines.
+
+
+## Shared colossus fight (2026-10-11)
+
+State 2 of both instances is a real colossus-0 encounter saved by the user. Findings and what is implemented:
+
+* The colossus is an ordinary character object (kind 4). The boss table's "life" is really **damage taken** per
+  part: `*(*(work)+0xE8) + 0x24 + 8*i` (0 at the start), max in the part definition (+0x1C): `getBossPartsLifeRatio`
+  = (max - damage) / max. Damage only grows, so two machines merge it with a per-part **max**.
+* Animation id: word +8 of the motion descriptor (offset in the loaded animation file, equal on every machine);
+  descriptor address = `table - [table+8] + id` with `table = *(class+0x2ac)`. The index relative to the table
+  is NOT stable for colossi (several tables).
+* `bosssync.py`: an EE routine called every frame from the logic hook (new `MB_FRAME_CB` in `hook.py`) forces the
+  host's motion, frame and rotation on the client's colossus and moves it (light move) when it drifts; the local AI
+  keeps running (its damage bookkeeping works on the pose that is shown). Whoever has the colossus running on its
+  own AI is in charge (host wins ties); a mirrored colossus counts as not awake. Verified: one instance with a
+  +60 m position offset (error 0.25 m), two instances (client mirrors host and vice versa, error < 1 m), damage
+  exchanged in both directions (`DEBUG_DAMAGE_AT`).
+* `barrier.py`: the encounter starts when an event script runs `BootBoss = bossStatStartDemo` (called once, then
+  `gameModeSet(1)` .. `gameModeCls(1)` for the intro cutscene; measured with `probe.py`). A detour makes that script
+  wait (yielding with `scrRun`, the world keeps running) until the peer is also waiting / already fighting or
+  `BOSS_BARRIER_SECONDS` (15) pass, so both players get the cutscene together. Verified with two scripted players.
+* Traps: a savestate carries the hook/guard code of the build that saved it, so the bridge rewrites them once per
+  session; the colossus sits at (-267, 8, 316) (a marker) until woken, then the object follows the body; pad
+  injection is camera-relative. `DEBUG_*` environment variables inject faults for tests.
+* Not done: cutscenes other than the encounter start (death cutscene of the colossus, ending...), pulling the
+  other player to the arena, colossus death handled by the merged damage but untested (needs a real kill),
+  more than two players on one colossus (pose only from the host / the player whose AI runs it).

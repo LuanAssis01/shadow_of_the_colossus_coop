@@ -33,6 +33,7 @@ import time
 
 from hook import MAILBOX, SITES, install as install_hook, is_our_jal, counters
 from pine import Pine, PineError
+import barrier
 import guard
 from pad import release as pad_release
 from pad import set_pad
@@ -44,6 +45,17 @@ PACKET = struct.Struct("<IIf3f4fI")
 # Appended on the wire only: the sender's horse. flags bit0 = a horse exists, then the same sample fields.
 HORSE = struct.Struct("<IIf3f4f")
 WIRE_SIZE = PACKET.size + HORSE.size
+# Also appended: the colossus of the sender's game (see bosssync.py). flags bit0 = a colossus is loaded, bit1 =
+# the pose is authoritative (only the host sets it); motion id, frame, position, rotation, part count, damage.
+BOSS = struct.Struct("<IIf3f4fI32f")
+FULL_SIZE = WIRE_SIZE + BOSS.size
+BOSS_PRESENT, BOSS_AUTH, BOSS_PENDING = 1, 2, 4   # PENDING: my game waits at the start of the encounter (barrier.py)
+BARRIER_SECONDS = float(os.environ.get("BOSS_BARRIER_SECONDS", "15"))
+_remote_pending = [0.0]       # last time the peer reported "waiting at the start of the encounter"
+_released_at = [0.0]
+_remote_running = [0.0]       # last time the peer reported its colossus running
+BOSS_ROLE = [None]            # "host" | "client" | None (no colossus sync): set by main()
+BOSS_LINK = [None]
 HORSE_PRESENT = 1
 CLASS_WORD = 0x01206DD8   # +4 of every character object
 PLAYER_HP = 0x012DE264    # current HP (float, 100 = full)
@@ -124,14 +136,50 @@ def read_local(p, player):
 
 
 NO_HORSE = HORSE.pack(0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+NO_BOSS = BOSS.pack(0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0, *([0.0] * 32))
 
 
-def pack(seq, index, frame, pos, quat, horse=None):
+def pack_boss(boss, pending=False):
+    if boss is None:
+        return BOSS.pack(BOSS_PENDING if pending else 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0, *([0.0] * 32))
+    mid, frame, pos, quat, damage, authoritative = boss
+    damage = (list(damage) + [0.0] * 32)[:32]
+    flags = BOSS_PRESENT | (BOSS_AUTH if authoritative else 0) | (BOSS_PENDING if pending else 0)
+    return BOSS.pack(flags, mid, frame, *pos, *quat, min(len(damage), 32), *damage)
+
+
+def pack(seq, index, frame, pos, quat, horse=None, boss=None, pending=False):
     wire = PACKET.pack(seq, index, frame, *pos, *quat, 0)
     if horse is None:
-        return wire + NO_HORSE
-    h_index, h_frame, h_pos, h_quat = horse
-    return wire + HORSE.pack(HORSE_PRESENT, h_index, h_frame, *h_pos, *h_quat)
+        wire += NO_HORSE
+    else:
+        h_index, h_frame, h_pos, h_quat = horse
+        wire += HORSE.pack(HORSE_PRESENT, h_index, h_frame, *h_pos, *h_quat)
+    return wire + pack_boss(boss, pending)
+
+
+_boss_seq = [-1]
+
+
+def apply_boss(data, pid):
+    """Colossus part of a datagram. Damage merges both ways; the pose is mirrored from the host only."""
+    link = BOSS_LINK[0]
+    if link is None or len(data) < FULL_SIZE:
+        return
+    flags, mid, frame, x, y, z, qx, qy, qz, qw, count, *damage = BOSS.unpack(data[WIRE_SIZE:FULL_SIZE])
+    if flags & BOSS_PENDING:
+        _remote_pending[0] = time.time()
+    if flags & BOSS_AUTH:
+        _remote_running[0] = time.time()
+    if not flags & BOSS_PRESENT or link.refresh() is None:
+        return
+    link.merge_damage(damage[:min(count, 32)])
+    # whoever has the colossus running on its own AI is in charge; when both do, the host
+    if flags & BOSS_AUTH and (not link.awake() or (BOSS_ROLE[0] == "client" and pid == 0)):
+        seq = PACKET.unpack(data[:PACKET.size])[0]
+        if seq > _boss_seq[0] or seq + 1000 < _boss_seq[0]:
+            _boss_seq[0] = seq
+            link.apply_pose(mid, frame, (x, y, z), (qx, qy, qz, qw))
 
 
 TELEPORT_DISTANCE = float(__import__("os").environ.get("TELEPORT_DISTANCE", "5.0"))
@@ -383,6 +431,11 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
             hook_call(p, 0x01353BB0, timeout=60.0)          # gStatUnloadHorseChara
             hook_call(p, 0x01353A98, 0xFFFFFFFF, timeout=60.0)  # gStatLoadHorseChara(-1)
             print("DEBUG: horse reloaded (guard runs: %d, clone objects deleted: %d)" % guard.counters(p), flush=True)
+        if "DEBUG_DAMAGE_AT" in os.environ and BOSS_LINK[0] and BOSS_LINK[0].boss and                 time.time() - _t_start > float(os.environ["DEBUG_DAMAGE_AT"]):
+            del os.environ["DEBUG_DAMAGE_AT"]           # test hook: hurt part 0 of the local colossus
+            b = BOSS_LINK[0].boss
+            p.writef(b.damage_addr(0), 5.0)
+            print("DEBUG: local damage on part 0 set to 5.0", flush=True)
         if scenario:
             scenario.tick(p)
         if send is not None:
@@ -402,7 +455,17 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
                     if "DEBUG_KILL_EVERY" in os.environ:
                         _debug_kill[0] = time.time() + float(os.environ["DEBUG_KILL_EVERY"])
             if wander is not None:
-                send(pack(seq, *wander, horse=horse))
+                link = BOSS_LINK[0]
+                waiting = False
+                if link:
+                    link.idle_check()
+                    waiting = barrier.pending(p)
+                    if waiting and (time.time() - _remote_pending[0] < 1.0 or time.time() - _remote_running[0] < 1.0):
+                        barrier.release(p)      # the peer is at the same point (or already fighting): go together
+                        if time.time() - _released_at[0] > 3.0:
+                            print("encounter start released together with the peer", flush=True)
+                        _released_at[0] = time.time()
+                send(pack(seq, *wander, horse=horse, boss=link.sample() if link else None, pending=waiting))
         for pid, data in recv():
             slot = remotes.slot_for(pid)
             if slot is None:
@@ -413,6 +476,7 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
                 remotes.parked.discard(pid)
             apply_remote(p, obj, data[:PACKET.size], index)
             apply_remote_horse(p, remotes, index, data)
+            apply_boss(data, pid)
             remotes.last_rx[pid] = time.time()
             if index == remotes.slots[0][0]:
                 target[0] = PACKET.unpack(data[:PACKET.size])
@@ -423,6 +487,8 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
                 index, obj = next(s for s in remotes.slots if s[0] == remotes.by_pid[pid])
                 print("player %d silent for %.1fs: parking clone %d" % (pid, DISCONNECT_SECONDS, index), flush=True)
                 park(p, obj, index)
+                if pid == 0 and BOSS_LINK[0] is not None:
+                    BOSS_LINK[0].stop_pose()
                 if index in remotes.horses:
                     park(p, remotes.horses[index], HORSE_SLOT + index)
                     remotes.horse_parked.add(index)
@@ -467,8 +533,19 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
                 m, t = p.read32_many([obj + CLASS + 0x1C0, obj + CLASS + 0x2AC])
                 line.append("clone%d motion %d pos (%.2f, %.2f, %.2f)" % (
                     index, (m - t) // MOTION_STRIDE, p.readf(obj + 0xA0), p.readf(obj + 0xA4), p.readf(obj + 0xA8)))
-            print("tick %d: %s | player (%.2f, %.2f) | heap free %d" % (
-                seq, " ; ".join(line), p.readf(mine.player + 0xA0), p.readf(mine.player + 0xA8), p.read32(HEAP_FREE)), flush=True)
+            bl = BOSS_LINK[0]
+            bs = ""
+            if bl is not None and bl.boss is not None:
+                import bosssync as _bs
+                cnt = p.read32_many([MAILBOX + _bs.MB_CALLS, MAILBOX + _bs.MB_TELEPORTS, MAILBOX + _bs.MB_MOVES])
+                tg = bl.last_target
+                bs = " | boss tgt %s" % ("(%.1f, %.1f)" % (tg[0], tg[2]) if tg else "-") + " calls/tp/mv %d/%d/%d" % tuple(cnt) + " %s%s motion %#x pos (%.1f, %.1f) damage %.1f" % (
+                    "AWAKE " if bl.awake() else "", "mirror " if bl.mirroring() else "",
+                    (bl.prev or (0, 0, 0, 0))[3], (bl.prev or (0, 0, 0, 0))[0], (bl.prev or (0, 0, 0, 0))[2],
+                    sum(bl.boss.read_damage()))
+            print("tick %d: %s | player (%.2f, %.2f) | heap free %d%s" % (
+                seq, " ; ".join(line), p.readf(mine.player + 0xA0), p.readf(mine.player + 0xA8), p.read32(HEAP_FREE), bs),
+                flush=True)
         next_tick += period
         delay = next_tick - time.time()
         if delay > 0:
@@ -478,6 +555,7 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
 
 
 _reacquire_at = [0.0]
+_fresh_code = [False]
 
 
 def reacquire_player(p, current):
@@ -521,8 +599,11 @@ def wait_world(p, stable=3.0, quiet=False):
     while True:
         player = None
         try:
-            if not hooks_installed(p):
+            if not hooks_installed(p) or not _fresh_code[0]:
+                # a savestate may carry an older build of the stubs/routines: rewrite them once per session
                 install_hook(p)
+                guard.install(p)
+                _fresh_code[0] = True
             if logic_running(p) and p.readf(PLAYER_HP) > 0 and world_settled(p):
                 player = local_player(p)
         except (PineError, StopIteration, SystemExit):
@@ -595,6 +676,9 @@ def run_session(p, send, recv, duration, local, players):
     from spawn import SpawnRefused, despawn_clones
     end = time.time() + duration if duration else None
     seq_box = [0]
+    if BOSS_ROLE[0]:
+        import bosssync
+        BOSS_LINK[0] = bosssync.BossLink(p)
     try:
         while True:
             try:
@@ -603,6 +687,9 @@ def run_session(p, send, recv, duration, local, players):
                     return
                 despawn_clones(p)
                 setup_clones(p, max(1, players - 1))
+                if BOSS_LINK[0] is not None:
+                    BOSS_LINK[0].install()
+                    barrier.install(p, int(BARRIER_SECONDS * 30))
                 tick_loop(p, player, None, send, recv, (end - time.time()) if end else None, local, seq_box)
                 return
             except WorldLost as exc:
@@ -620,6 +707,9 @@ def run_session(p, send, recv, duration, local, players):
     finally:
         # never leave puppets behind: without the bridge they would replay the last state forever
         try:
+            if BOSS_LINK[0] is not None:
+                BOSS_LINK[0].uninstall()
+                barrier.uninstall(p)
             despawn_clones(p)
             pad_release(p)
             print("bridge stopped: clones removed", flush=True)
@@ -755,7 +845,7 @@ def main():
             horse = list(HORSE.unpack(data[PACKET.size:WIRE_SIZE]))
             horse[3] += dx
             horse[5] += dz
-            pending.append(PACKET.pack(*fields) + HORSE.pack(*horse))
+            pending.append(PACKET.pack(*fields) + HORSE.pack(*horse) + data[WIRE_SIZE:])
 
         def recv():
             out, pending[:] = [(0, d) for d in pending], []
@@ -790,12 +880,14 @@ def main():
         out = []
         while True:
             try:
-                data, addr = sock.recvfrom(256)
+                data, addr = sock.recvfrom(1024)
             except BlockingIOError:
                 return out
             if len(data) == PACKET.size:
                 data += NO_HORSE                              # sender without horse support
-            if len(data) != WIRE_SIZE:
+            if len(data) == WIRE_SIZE:
+                data += NO_BOSS                               # sender without colossus support
+            if len(data) != FULL_SIZE:
                 continue
             if not server:
                 out.append((PACKET.unpack(data[:PACKET.size])[-1], data))   # the host stamped the origin pid
@@ -810,6 +902,8 @@ def main():
             out.append((pid, data))
 
     duration = float(os.environ["DURATION"]) if "DURATION" in os.environ else None
+    if os.environ.get("BOSS_SYNC", "1") != "0":
+        BOSS_ROLE[0] = {"host": "host", "join": "client"}.get(mode)
     send_fn, recv_fn = None if mode == "recv" else send, (lambda: []) if mode == "send" else recv
     local = simulated_local() if "SIM" in os.environ else None
     if mode == "send":

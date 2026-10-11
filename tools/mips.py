@@ -79,6 +79,9 @@ class Asm:
     def and_(self, rd, rs, rt):
         self.emit(_rtype(rs, rt, rd, 0, 0x24))
 
+    def subu(self, rd, rs, rt):
+        self.emit(_rtype(rs, rt, rd, 0, 0x23))
+
     def sltu(self, rd, rs, rt):
         self.emit(_rtype(rs, rt, rd, 0, 0x2B))
 

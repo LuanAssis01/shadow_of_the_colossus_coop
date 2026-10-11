@@ -23,7 +23,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
 SLOTS = {"a": 28011, "b": 28012}
-STATE_SLOT = 1
+STATE_SLOT = int(os.environ.get("STATE_SLOT", "1"))   # savestate slot loaded into both instances
 PORT = 5020
 
 
@@ -128,11 +128,20 @@ def main():
     env = dict(os.environ, DURATION=duration, PYTHONUNBUFFERED="1")
     logs = {"b": open(os.path.join(ROOT, "work", "net_b_win.log"), "w"),
             "a": open(os.path.join(ROOT, "work", "net_a_win.log"), "w")}
+    def bridge_env(name):
+        extra = {"PINE_SLOT": str(SLOTS[name])}
+        for key in ("DEBUG_DAMAGE_AT", "DEBUG_KILL_EVERY"):
+            if os.environ.get(key + "_" + name.upper()):
+                extra[key] = os.environ[key + "_" + name.upper()]
+        if os.environ.get("SCENARIO_" + name.upper()):          # scripted controller for this instance
+            extra["SCENARIO"] = os.environ["SCENARIO_" + name.upper()]
+        return dict(env, **extra)
+
     subprocess.Popen([sys.executable, "netbridge.py", "host", str(PORT)], cwd=TOOLS, stdout=logs["b"],
-                     stderr=subprocess.STDOUT, env=dict(env, PINE_SLOT=str(SLOTS["b"])))
+                     stderr=subprocess.STDOUT, env=bridge_env("b"))
     time.sleep(2.0)
     subprocess.Popen([sys.executable, "netbridge.py", "join", "127.0.0.1", str(PORT)], cwd=TOOLS,
-                     stdout=logs["a"], stderr=subprocess.STDOUT, env=dict(env, PINE_SLOT=str(SLOTS["a"])))
+                     stdout=logs["a"], stderr=subprocess.STDOUT, env=bridge_env("a"))
     print("co-op running for %s s: A (left) = client, B (right) = host; logs in work/net_*_win.log" % duration)
 
 

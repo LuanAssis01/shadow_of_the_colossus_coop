@@ -37,6 +37,9 @@ MB_SAVED_SP = 0x60
 # every frame before any script runs: held/push/release/repeat button words and the left
 # stick bytes (see tools/pad.py).
 MB_PAD_EN, MB_PAD_WORDS, MB_PAD_STICK = 0x100, 0x104, 0x114
+# Per-frame callback: when MB_FRAME_CB is non-zero the logic hook calls it (no arguments) every frame, before
+# any script runs, on the private stack (see bosssync.py).
+MB_FRAME_CB = 0x118
 PAD_STATE = 0x01287A00
 PAD_WORD_OFFSETS = (0x00, 0x08, 0x0C, 0x10)
 PAD_STICK_OFFSET = 0x54
@@ -85,6 +88,15 @@ def build_stub(base, original, counter, commands):
         a.lw("t1", MB_PAD_STICK, "s0")
         a.sw("t1", PAD_STICK_OFFSET, "t2")
         a.label("nopad")
+        a.lw("t9", MB_FRAME_CB, "s0")
+        a.beq("t9", "zero", "nocb")
+        a.nop()
+        a.sw("sp", MB_SAVED_SP, "s0")
+        a.li("sp", PRIVATE_STACK_TOP)
+        a.jalr("t9")
+        a.nop()
+        a.lw("sp", MB_SAVED_SP, "s0")
+        a.label("nocb")
         a.lw("t0", MB_CMD, "s0")
         a.beq("t0", "zero", "skip")
         a.addiu("t1", "zero", CMD_CALL)  # delay slot
