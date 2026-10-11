@@ -43,14 +43,14 @@ def do_import(ram):
         open(core, "wb").write(f.read(END - START))
     r = headless("-import", core, "-overwrite", "-noanalysis", "-loader", "BinaryLoader",
                  "-loader-baseAddr", hex(START), "-processor", "r5900:LE:32:default",
-                 "-scriptPath", os.path.join(HERE, "ghidra_scripts"), "-postScript", "SotcDecompile.java",
+                 "-scriptPath", os.path.join(HERE, "gscripts"), "-postScript", "SotcDecompile.java",
                  SYMBOLS, os.path.join(PROJECT_DIR, "import.txt"), "GAMEUTIL_get_player_obj")
     print(r.stdout[-2000:], r.stderr[-2000:])
 
 
 def decompile(targets):
     out = os.path.join(PROJECT_DIR, "out.txt")
-    r = headless("-process", PROGRAM, "-noanalysis", "-scriptPath", os.path.join(HERE, "ghidra_scripts"),
+    r = headless("-process", PROGRAM, "-noanalysis", "-scriptPath", os.path.join(HERE, "gscripts"),
                  "-postScript", "SotcDecompile.java", SYMBOLS, out, *targets)
     if r.returncode != 0 or not os.path.exists(out):
         print(r.stdout[-3000:], r.stderr[-3000:])
