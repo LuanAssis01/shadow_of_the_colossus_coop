@@ -2,6 +2,8 @@
 
   python3 warp.py list          the 16 colossus records (area, arrival point, max HP/grip)
   python3 warp.py boss N        put the player and the horse at colossus N's arrival point (0 = first)
+  python3 warp.py fight N       make colossus N the active one (bossStatSetActiveBoss), then warp there: the
+                                colossus is in the arena when the area streams in
 
 Every colossus has a record in the boss table (PTR_s_DEFAULT_0156b440 -> +0x10, 0xec bytes each): +0x50
 flags, +0x51 seamless area id, +0x64 arrival point relative to the area centre (x and z are stored
@@ -41,6 +43,16 @@ def arrival(p, n):
     return (cx - rx, cy + ry, cz - rz), heading, area, max_hp, max_grip
 
 
+SET_ACTIVE_BOSS = 0x01349518   # bossStatSetActiveBoss(record): enables only that colossus' layout (game flags),
+                               # sets the active index (_gameWork 8), the clear count and its "alive" flag
+
+
+def activate(p, n):
+    """Make colossus n the one the world spawns (also what the game does when the sword points at the next one).
+    Note: setBossClearCnt(n) is part of it, so the progress counter follows."""
+    call(p, SET_ACTIVE_BOSS, record(p, n))
+
+
 def heading_quat(degrees):
     half = math.radians(degrees) / 2.0
     return (0.0, math.sin(half), 0.0, math.cos(half))
@@ -74,3 +86,6 @@ if __name__ == "__main__":
                 i, area, pos[0], pos[1], pos[2], heading, hp, grip))
     elif sys.argv[1] == "boss":
         print("warped to", warp_to_boss(pine, int(sys.argv[2])))
+    elif sys.argv[1] == "fight":
+        activate(pine, int(sys.argv[2]))
+        print("colossus %s active; warped to" % sys.argv[2], warp_to_boss(pine, int(sys.argv[2])))

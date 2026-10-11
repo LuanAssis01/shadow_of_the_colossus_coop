@@ -16,6 +16,11 @@ body. Three pieces prevent that:
     replaced by CLONE_DELETED, which zeroes the clone's mailbox pointer and tail-calls the original
     handler (kept at the pointer's address + ORIGINAL_OFFSET). So a mailbox pointer is either a live
     clone or 0, whoever deletes it, and obj+0x18 == CLONE_DELETED tells "this object is one of ours".
+  * the class's flush clears the instance cache of the layout DEFINITION the clone came from, which is shared
+    with the real Wander / horse; CLONE_DELETED puts the real object back afterwards (pointer word +
+    DEFINITION_OFFSET holds the definition, written by spawn.py). Without that, deleting the clones before a
+    stage unload left the real Wander without a registered instance and the accessories loaded after a
+    colossus dies waited forever for their parent (initlayout dependency loop).
   * DELETE_ALL requests the deletion of every clone that still carries the marker.
   * stagemanager_unloadstagecore runs DELETE_ALL first (a restart, i.e. a death at the shrine, keeps the
     segments' assets, so the clones survive it).
@@ -24,6 +29,7 @@ The bridge then sees the clones gone and spawns them again once the world is pla
 import struct
 import sys
 
+from heapgrow import in_heap
 from hook import MAILBOX, call
 from mips import Asm
 from pine import Pine
@@ -35,7 +41,7 @@ RESTART_STAGE_CORE = 0x013667D8
 RESTART_PROLOGUE = (0x27BDFFF0, 0x00E0402D)     # addiu sp,sp,-16 ; daddu t0,a3,zero
 
 CLONE_DELETED = 0x000F5000      # delete-request handler installed on every clone object
-DELETE_ALL = 0x000F5100         # request deletion of every owned clone
+DELETE_ALL = 0x000F5200         # request deletion of every owned clone
 UNLOAD_DETOUR = 0x000F5300
 RESTART_DETOUR = 0x000F5400
 GUARD_END = 0x000F5500
@@ -45,12 +51,24 @@ GUARD_STACK_TOP = 0x000E8000
 # Mailbox words holding clone pointers (see spawn.py): Wanders at 0x70..0xf0, horses at 0x120..0x160.
 POINTER_RANGES = ((0x70, 0xF0), (0x120, 0x160))
 ORIGINAL_OFFSET = 0x400         # original delete-request handler of the object at pointer word + 0x400
+DEFINITION_OFFSET = 0x800       # the layout definition the clone was spawned from, at pointer word + 0x800
 MB_GUARD_RUNS = 0x180           # times DELETE_ALL ran because of a stage unload
 MB_CLONES_DELETED = 0x184       # clone objects whose deletion went through CLONE_DELETED
 
 
 def build_clone_deleted():
+    """Clear the clone's mailbox words, run the class's own flush, then give the definition its instance back:
+    the flush clears the definition's instance cache (definition+8) although it holds the REAL object (the clone
+    was spawned from the same definition), and children (hair, the body's alias objects) find their parent
+    through that cache - with it cleared the next accessory load (after a colossus dies) waited forever in
+    initlayout."""
     a = Asm(CLONE_DELETED)
+    a.addiu("sp", "sp", -0x30)
+    a.sd("ra", 0x00, "sp")
+    a.sd("s0", 0x08, "sp")
+    a.sd("s1", 0x10, "sp")
+    a.sd("s2", 0x18, "sp")
+    a.move("s2", "a0")
     for start, end in POINTER_RANGES:
         tag = "r%x" % start
         a.li("t0", MAILBOX + start)
@@ -60,23 +78,46 @@ def build_clone_deleted():
         a.bne("t2", "a0", tag + "n")
         a.nop()
         a.lw("t9", ORIGINAL_OFFSET, "t0")
+        a.lw("s0", DEFINITION_OFFSET, "t0")
         a.sw("zero", 0, "t0")
         a.sw("zero", ORIGINAL_OFFSET, "t0")
+        a.sw("zero", DEFINITION_OFFSET, "t0")
         a.li("t3", MAILBOX + MB_CLONES_DELETED)
         a.lw("t2", 0, "t3")
         a.addiu("t2", "t2", 1)
         a.sw("t2", 0, "t3")
-        a.beq("t9", "zero", "out")
+        a.move("s1", "zero")
+        a.beq("s0", "zero", tag + "call")
         a.nop()
-        a.jr("t9")                      # tail call: the class's own flush, a0 = obj, ra = caller
+        a.lw("s1", 8, "s0")             # the definition's instance (the real object) before the flush
+        a.label(tag + "call")
+        a.beq("t9", "zero", "restore")
+        a.nop()
+        a.jalr("t9")                    # the class's own flush, a0 = obj
+        a.nop()
+        a.beq("zero", "zero", "restore")
         a.nop()
         a.label(tag + "n")
         a.addiu("t0", "t0", 4)
         a.bne("t0", "t1", tag)
         a.nop()
-    a.label("out")
-    a.jr("ra")
+    a.beq("zero", "zero", "out")
     a.nop()
+    a.label("restore")
+    a.beq("s0", "zero", "out")
+    a.nop()
+    a.beq("s1", "zero", "out")
+    a.nop()
+    a.beq("s1", "s2", "out")            # the cache really was the clone: leave it cleared
+    a.nop()
+    a.sw("s1", 8, "s0")
+    a.label("out")
+    a.ld("ra", 0x00, "sp")
+    a.ld("s0", 0x08, "sp")
+    a.ld("s1", 0x10, "sp")
+    a.ld("s2", 0x18, "sp")
+    a.jr("ra")
+    a.addiu("sp", "sp", 0x30)
     return a.assemble()
 
 
@@ -100,6 +141,7 @@ def build_delete_all():
         a.beq("t0", "t1", tag + "del")
         a.nop()
         a.sw("zero", 0, "s0")             # not ours any more (freed or reused): only forget it
+        a.sw("zero", DEFINITION_OFFSET, "s0")
         a.beq("zero", "zero", tag + "n")
         a.sw("zero", ORIGINAL_OFFSET, "s0")
         a.label(tag + "del")
@@ -198,7 +240,7 @@ def claim(p, pointer_word):
 
 def owned(p, obj):
     """True while obj is a live clone of ours (its delete-request handler is CLONE_DELETED)."""
-    if not obj or obj & 3 or not 0x100000 <= obj < 0x2000000:
+    if not obj or obj & 3 or not in_heap(obj):
         return False
     return p.read32(obj + 0x18) == CLONE_DELETED
 

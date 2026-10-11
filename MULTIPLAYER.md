@@ -24,7 +24,11 @@ and PINE for live memory access and code injection.
 | `puppet.py [CLONE [SLOT]]` | swap a clone's script for an injected puppet script driven via PINE (one state block per slot) |
 | `netbridge.py` | UDP state bridge (echo / host / join / recv / sendfile), 30 Hz, multi-peer star relay, disconnect watchdog |
 | `snap.py` | "screenshot" through a PINE savestate (`Screenshot.png` + RAM); Wayland blocks real grabs |
-| `disasm.py` | tiny R5900 disassembler over live RAM |
+| `disasm.py` | tiny R5900 disassembler over live RAM (`RAM=file` for a RAM image) |
+| `decompile.py` | Ghidra headless decompiler on Windows (`import RAM.bin`, then names/addresses) |
+| `heapgrow.py` | donate unused RAM to the game heap; `in_heap()` for pointer checks |
+| `bosskill.py` | kill the active colossus (game's own path) and log the aftermath |
+| `bosstour.py` | activate + warp to each of the 16 colossi, report and screenshot |
 | `cb2util/` + `cbdec` | CodeBreaker v7 decryption (used to bootstrap the HP/grip addresses) |
 
 PCSX2: Flatpak `net.pcsx2.PCSX2` 2.8.2, PINE enabled (backup of the original
@@ -330,6 +334,86 @@ State 2 of both instances is a real colossus-0 encounter saved by the user. Find
   more than two players on one colossus (pose only from the host / the player whose AI runs it).
 
 
+## Session 2026-10-11 (afternoon): fight freeze, colossus death, mailbox overlaps, pull, boss tour
+
+**Freeze in the shared fight = out of memory (fixed).** The user's session froze on the host ~2 min into the colossus
+fight. Diagnosis from a savestate (`work/regs.py` + the message buffer at `0x00201DC8`): `_iosMallocAlign: memory
+over ptn 0x1e0c88 size 0x65c` from `reset_game_camera_param_update_data_manager` (boss camera). The heap (one
+partition `0x001E0C88` covering `0x00290FFC..0x01FE0000`) had 44 KB left in 413 fragments: a colossus fight takes
+~700 KB, the clones the rest. `heapgrow.py` hands unused RAM to the allocator: it writes a fake "in use" block
+header (size/next/prev as 24-bit word indexes, partition split over bytes +3/+7/+0xB, in-use bit 24 of +0xC, no
+neighbours) over `0x00098000..0x000D8000` (256 KB, zero in every snapshot, below our stacks) and releases it with the
+game's own `iosFree`. The free counter `0x001E0BF0` is in WORDS (x4 = bytes). The kernel gap `0x25000..0x75000` is also
+zero, but PINE drops writes below `0x80000` (and freeing an unwritten header would corrupt the heap: never do it).
+The bridge donates once per world (idempotent; a savestate from before the donation gets it again). Measured: 283 s
+shared fight on both instances, free counter never below ~287K words (the frozen run went down to ~21K).
+Consequence: game objects can now live below 1 MB; every "valid object pointer" check uses `heapgrow.in_heap()`
+(the old `>= 0x100000` checks made the bridge believe the engine had deleted a horse clone allocated at
+`0x00098090`, so it spawned horse after horse until the heap ran out; `chars.py` only scanned above 16 MB).
+
+**Mailbox overlaps (three, all fixed, map now in `hook.py`).** `barrier.py` used `+0x200..` = puppet slot 0's state
+(its "pending" flag read puppet data); `bosssync` used `+0x500..+0x53F` = the guard's original delete handlers of
+the horse clones (`+0x520..`): the colossus pose floats overwrote them and deleting the horse jumped to a float
+(`t9 = 0xC3AAB3FA`); probe counters at `+0x1B0..` ran into the puppet blocks once more than 5 probes were used.
+
+**`probe.py` hung the game** when the probed function starts with a branch (`gameModeCls` = `beq a0,zero`): the
+copied branch kept its relative target. Branches are now re-issued with an absolute exit; jumps are refused. The
+probe set is configurable (`probe.py install NAME...`, `PROBE_NAMES` in bosskill.py), `remove` restores.
+
+**Decompiler on Windows.** `tools/decompile.py` drives Ghidra headless directly (no REA): `decompile.py import RAM.bin`
+once (raw R5900 slice `0x100000..0x1600000` + the 6477 recovered symbols, ~25 s), then `decompile.py NAME|0xADDR ...`
+(~10 s per batch). JDK 21 portable in `tools/dl/jdk` (not in git). `disasm.py` reads a RAM image with `RAM=file`;
+`work/xref.py` finds jal/j/pointer references, `work/heapwalk.py` / `heapphys.py` walk the heap.
+
+**How a colossus dies (verified on colossus 0, `bosskill.py`).**
+* Life = float at `base+0x44` (`base = *GetSCRCharaAIWorkPtr(boss)`), max at `+0x40` (200 for Valus). The per-part
+  "damage" is bookkeeping; the hit handler recomputes life = max - damage.
+* Killing blow (hit handler tail `0x013776C0`): life = 0, `LayoutClass(boss)+0x1AC = 1`, `playerEnableDeath`
+  (`0x01465E88`) = 0, `scriptIntrSignal(*0x01566BEC)` = the DEAD_BOSS interrupt. The arena's waiting event script
+  `st_boss_status` jumps to `st_boss_dead`: death cutscene, tendrils (`CreateDeathTentacle`; their count is cut when
+  the heap has < 1 MB free), +4 max HP reward, stage load to the shrine. `Boss.kill()` replays exactly this.
+* `SCRExecBossPreProcess` loads the death motions (`checkDeadMotionLoadByScriptDataSystem`) when life <= 0 and the
+  dead flag `+0xEC` is still 0. Dead ends: the script command at `0x01370000` sets `+0xEC` itself -> halt "motion
+  address is NULL: anim/minotaur_A_death_front_loop.anb"; life = 0 alone -> collapse + tendrils, then nothing (no
+  interrupt); `setBossAbsoluteDeath` / max part damage -> no effect; any kill during the intro cutscene -> the intro
+  waits forever.
+* Bridge: life travels in the colossus packet (`BOSS` + life float); a peer life of 0 runs `Boss.kill()` locally
+  (never during a local cutscene: it waits until the scene ends); the pose mirror stops on a dead colossus and only
+  forces a motion whose descriptor is loaded on this machine (death motions are loaded on demand).
+  `DEBUG_KILL_BOSS_AT=SEC` (per instance `DEBUG_KILL_BOSS_AT_A/B` in coop_local) kills the local colossus for tests.
+
+**Deleting a clone broke the real Wander (fixed).** The class flush clears the instance cache of the layout DEFINITION
+(`definition+8`), which the clone shares with the real Wander/horse. All 7 caches (Wander, sheath, hair, 2 alias
+objects, horse, helper) went to 0 after `guard.delete_all`; the accessories re-instantiated after a colossus dies then
+waited forever for their parent (`initlayout` dependency loop, seen on both instances after the kill). spawn.py now
+records each clone's definition at pointer word + 0x800 and the clone's delete handler restores the real instance
+after the flush. Verified: spawn Wander + horse, delete, twice: caches identical to before.
+
+**Pull to the colossus (`netbridge.Puller`, verified).** A peer waiting at an encounter start or fighting sends its
+position; if I am more than `PULL_DISTANCE` (150 m) away, not in a cutscene and not fighting, and the peer is within
+400 m of MY active colossus' arrival point, the bridge holds me (and my horse) 25 m above that arrival point for
+`PULL_HOLD` (15 s, terrain streaming), drops me there and restarts my fall at the drop point
+(`ResetCharacterClassFallDownInfo(class)`, `0x011BB4B8`: the fall start lives at class+0x10B0); once per
+`PULL_COOLDOWN` (120 s); `PULL=0` disables it. Measured: shrine -> Valus (568 m), landed at (-305, 3.2, 271), HP 100.
+Dead end: dropping at the PEER's spot inside the arena: the arena behind its entrance is a stage segment loaded when
+the player walks in; with 15 s or 30 s holds (and `forceLoadSeamlessStage` every second) there is no floor and the
+player falls to the kill plane (y -300) and dies. The encounter barrier now waits 30 s (`BOSS_BARRIER_SECONDS`);
+a player arriving later joins the running fight (the pose mirror handles that).
+
+**Any colossus on demand.** `bossStatSetActiveBoss(record)` enables only that colossus' layout (game flags), sets the
+active index (`_gameWork 8`), the clear count and its "alive" flag. `warp.py fight N` = activate + warp;
+`bosstour.py` visits all 16 from a savestate and screenshots each (`work/tour/`). Result (shrine state, 20 s
+streaming hold + 8 s): the player lands safely at every arrival point; the colossus object exists for 11 of 16
+(0-6, 8, 9, 11, 12; 22-193 m from the arrival point, #4 at 641 m). 7, 10, 13, 14, 15 had no colossus object yet
+(their arenas probably spawn it through an event or need the walk-in). Max HP follows the clear count
+(100 + 4 per colossus).
+
+**Kill test end to end (two instances, `DEBUG_KILL_BOSS_AT_B=70`):** host kills, client receives life 0 and kills
+its own colossus; both play the death cutscene, tendrils, white light, shrine, and stop at the game's own
+"Você gostaria de salvar?" prompt (a human answers it; menu cursor injection does not work: those dialogs read
+input elsewhere, only "confirm" 0x40 and "back" 0x10 were found). Clones are removed by the guard before the
+stage unload and rebuilt once the world is playable.
+
 ## STATUS (2026-10-11) - done and missing
 
 Done and verified (two PCSX2 instances on one Windows PC, `python tools/coop_local.py`):
@@ -345,11 +429,12 @@ Done and verified (two PCSX2 instances on one Windows PC, `python tools/coop_loc
 Missing / unverified:
 - [ ] Verify by eye with two people (pose smoothness, horse, hits on the mirrored colossus register damage,
       the client takes no phantom hits from its own AI while mirroring).
-- [ ] Colossus death: merged damage should trigger the death sequence on both machines; needs a real kill.
+- [x] Colossus death on both machines (life sync + `Boss.kill()`), verified with a scripted kill (2026-10-11).
+- [x] Out-of-memory freeze in the fight (heapgrow), mailbox overlaps, clone deletion breaking the real Wander.
+- [x] Pull a far player to the colossus (arrival point), any colossus on demand (`warp.py fight N`).
 - [ ] Other cutscenes: colossus death/ending/other demos are per machine (no barrier); only the encounter start
       is aligned. Idea: detours on `gameModeSet(1)` / `demoManStart` with the same wait-for-peer barrier.
-- [ ] Pull the other player to the arena when one starts an encounter (regroup teleport, needs the terrain-streaming
-      hold trick of `warp.py`).
+- [ ] Answering the post-kill save prompt from scripts (for unattended tests); colossi 7, 10, 13-15 via warp.
 - [ ] World progress sync (game flags `_gameFlagSet/_gameFlagChk`, dead-boss flags, checkpoints, deaths of the
       colossus on both save files).
 - [ ] 3+ players on one colossus; latency/NAT/VPN test between two real machines; mesh instead of star relay.

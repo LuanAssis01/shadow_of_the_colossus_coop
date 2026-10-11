@@ -36,7 +36,7 @@ import struct
 import time
 
 import guard
-from guard import CLONE_DELETED, ORIGINAL_OFFSET
+from guard import CLONE_DELETED, DEFINITION_OFFSET, ORIGINAL_OFFSET
 from hook import MAILBOX, call, counters
 from layout import handle_block, resolve, segment_entries, u32
 from mips import Asm
@@ -197,11 +197,13 @@ def build_routine(groups, mailbox_slot=MAILBOX + MB_CLONES):
         a.move("t0", "zero")
         a.jal(INITSTAGE)
         a.move("t1", "zero")  # delay slot
-        for entry, *_rest in seg_items:
+        for entry, definition, *_rest in seg_items:
             a.li("t0", entry)
             a.lw("t1", 0x48, "t0")
             a.li("t2", mailbox_slot)
             a.sw("t1", 4 * k, "t2")
+            a.li("t3", definition)            # guard.py restores the definition's real instance on delete
+            a.sw("t3", DEFINITION_OFFSET + 4 * k, "t2")
             a.bne("t1", "zero", "claim%d" % k)
             a.nop()
             a.beq("zero", "zero", "next%d" % k)
@@ -333,6 +335,36 @@ def diagnose(p, groups, k):
         p.read32(MAILBOX + MB_ALLOC_FAILS))
 
 
+LAYOUT_TYPES = (9, 0x0A, 0x0B, 0x0D, 0x16)   # layout object +0x08 type byte (character, script, alias...)
+
+
+def repair_definitions(p):
+    """Give the real Wander's / horse's layout definitions their instance back where a clone deletion cleared it.
+
+    Deleting a clone clears its definition's instance cache (definition+8), which the real object shares; guard.py
+    restores it for clones spawned by this version, but clones carried in from an older savestate have no recorded
+    definition. With the cache at 0 the accessories loaded after a colossus dies (segment 0xC3 depends on the
+    player definition) wait forever in initlayout. Returns the number of caches repaired."""
+    from heapgrow import in_heap
+    ram = p.read_block(0, 32 << 20)
+    segments = wander_segments(ram) + [u32(ram, HORSE_SEGMENT_VAR)]
+    clones = {u32(ram, MAILBOX + off) for start, end in guard.POINTER_RANGES for off in range(start, end, 4)}
+    fixed = 0
+    for segment in segments:
+        if not segment:
+            continue
+        for entry in segment_entries(ram, call(p, GC_GET_STAGE_DATA, segment)):
+            obj = u32(ram, entry + 0x48)
+            definition = u32(ram, handle_block(ram, entry + 4) + 0x10)
+            if not definition or u32(ram, definition + 8) or not obj or obj in clones or not in_heap(obj):
+                continue
+            if ram[obj + 8] not in LAYOUT_TYPES or p.read32(obj + 0x18) == CLONE_DELETED:
+                continue
+            p.write32(definition + 8, obj)
+            fixed += 1
+    return fixed
+
+
 def despawn_clones(p):
     """Delete every clone (Wanders and horses) through the EE routine the stage guard uses: it only
     deletes objects that still carry our delete handler, so a stale pointer is never deleted."""
@@ -342,6 +374,7 @@ def despawn_clones(p):
             p.write_block(MAILBOX + start, bytes(end - start))
         return
     guard.delete_all(p)
+    repair_definitions(p)
 
 
 def main():

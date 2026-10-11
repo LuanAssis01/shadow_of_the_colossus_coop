@@ -29,7 +29,9 @@ from puppet import (CL_FRAME, CL_MOTION, CL_PREV_FRAME, DEBUG_SET_OBJECT_GEOMETR
 
 CLASS = 0x90
 ROUTINE = 0x000F6000
-STATE = MAILBOX + 0x500          # same layout as a puppet state block, plus the object at +0x14
+STATE = MAILBOX + 0xB00          # same layout as a puppet state block, plus the object at +0x14
+# (+0x500 collided with guard.py's horse words at +0x520..+0x55F: the pose overwrote the horse clone's delete
+# handler and deleting the horse jumped to a float)
 ST_OBJ = 0x14
 MB_CALLS, MB_TELEPORTS, MB_MOVES = 0x1A0, 0x1A4, 0x1A8   # mailbox counters, for diagnostics
 MAX_PARTS = 32
@@ -219,7 +221,7 @@ class BossLink:
 
     # --- local -> wire ---------------------------------------------------------------------------------
     def sample(self):
-        """(motion id, frame, pos, quat, damage list, awake) of the local colossus, or None."""
+        """(motion id, frame, pos, quat, damage list, awake, life) of the local colossus, or None."""
         boss = self.refresh()
         if boss is None:
             return None
@@ -235,7 +237,7 @@ class BossLink:
             if pm != mid or abs(px - x) + abs(pz - z) > 0.05:
                 self.last_change = now
         self.prev = (x, y, z, mid)
-        return mid, f32(frame), (x, y, z), quat, boss.read_damage(), self.awake()
+        return mid, f32(frame), (x, y, z), quat, boss.read_damage(), self.awake(), boss.life()[0]
 
     # --- wire -> local ---------------------------------------------------------------------------------
     def apply_pose(self, mid, frame, pos, quat, blend=6.0):
@@ -246,6 +248,10 @@ class BossLink:
         p = self.p
         if p.read32(GAME_MODE) & 1:
             self.stop_pose()    # the local game is in a cutscene/menu: its own demo drives the colossus
+            return
+        life, _mx, dead = boss.life()
+        if life <= 0.0 or dead:
+            self.stop_pose()    # dying here: the local game plays its own death (its motions are loaded locally)
             return
         flags = FLAG_POSE | FLAG_MOTION
         cx, cy, cz = (p.readf(boss.obj + 0xA0 + 4 * i) for i in range(3))
@@ -261,6 +267,10 @@ class BossLink:
         self.last_target = pos
         self.last_applied = now
         motion = self.table_base() + mid if mid else 0
+        # some motions (the death ones) are loaded on demand: only force a motion whose descriptor is really
+        # there on this machine, i.e. its word +8 is the id (forcing an unloaded one halts the game)
+        if motion and p.read32(motion + 8) != mid:
+            motion = 0
         block = struct.pack("<IIIffI8x4f4f", 0, flags, motion, frame, blend, boss.obj, pos[0], pos[1], pos[2], 1.0, *quat)
         p.write_block(STATE, block)
 
@@ -274,6 +284,18 @@ class BossLink:
         """Release the pose when nothing has been mirrored for a while."""
         if self.last_target is not None and time.time() - self.last_applied > 1.5:
             self.stop_pose()
+
+    def merge_life(self, remote):
+        """Lower the local life to the peer's. Never during a local cutscene/menu: a colossus killed while its
+        intro plays leaves the intro waiting forever (tested); the merge simply happens once the scene ends."""
+        boss = self.refresh()
+        if boss is None or self.p.read32(GAME_MODE) & 1:
+            return False
+        life, _mx, dead = boss.life()
+        if remote <= 0.0 < life and not dead:
+            boss.kill()             # the game's own killing-blow sequence: death cutscene, tendrils, shrine
+            return True
+        return boss.merge_life(remote)
 
     def merge_damage(self, remote):
         boss = self.refresh()

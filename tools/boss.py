@@ -11,6 +11,17 @@ Facts (verified on the dormant first colossus, savestate 2; the structure matche
     part definitions (0x58 bytes each: +0 id, +0x1c maximum life), base+0xE8 = the damage block: the DAMAGE taken
     by part i is the float at block + 0x24 + 8*i (SCRGetBossPartsDamage, 0 at the start; getBossPartsLifeRatio
     = (max - damage) / max).
+  * the colossus' LIFE is the float at base+0x44 (maximum at base+0x40; 200 for the first colossus). A hit lowers it
+    (SCRExecBossPreProcess -> 0x013774c0) besides adding to the part's damage. Every frame the same function checks
+    life <= 0 with the dead flag base+0xEC still 0: then it loads the death motions (checkDeadMotionLoadByScript-
+    DataSystem), sets the flag and marks the character dead (SCRCharaDead). Writing life = 0 is therefore a clean
+    kill through the game's own path; setting +0xEC by hand (the script command at 0x01370000 does) skips the
+    motion load and the game halts on "motion address is NULL: anim/..._death_front_loop.anb".
+  * the hit handler (tail at 0x013776C0) recomputes life = max - damage and, when it reaches 0, sets life = 0,
+    LayoutClass(boss)+0x1AC = 1, playerEnableDeath (0x01465E88) = 0 (the player can no longer die) and raises the
+    DEAD_BOSS script interrupt (*0x01566BEC): st_boss_status, the arena's waiting event script, jumps to
+    st_boss_dead (death cutscene, tendrils, return to the shrine). Boss.kill() replays exactly that sequence;
+    life = 0 alone plays the collapse and the tendrils but nothing after them (the interrupt is never raised).
   * damage only ever goes up during a fight, so two machines fighting the same colossus can merge with a
     per-part maximum: nothing is lost when both hit different parts, and the order of updates does not matter.
 The boss' AI does not run until the game's own trigger (an event script runs BootBoss = bossStatStartDemo when
@@ -27,6 +38,10 @@ from pine import Pine
 GET_BOSS_OBJ = 0x013439F0
 GET_AI_WORK = 0x013CFB28
 CLASS = 0x90
+GET_LAYOUT_CLASS = 0x011EBDA0
+SCRIPT_INTR_SIGNAL = 0x011FD008
+SCR_INTR_DEAD_BOSS = 0x01566BEC    # holds the DEAD_BOSS interrupt definition
+PLAYER_ENABLE_DEATH = 0x01465E88
 
 
 class Boss:
@@ -37,6 +52,7 @@ class Boss:
             raise LookupError("no boss object (not in a colossus area)")
         work = call(p, GET_AI_WORK, self.obj)
         base = p.read32(work)
+        self.base = base
         self.count, self.defs, self.block = p.read32_many([base + 0x54, base + 0x10, base + 0xE8])
         if not 0 < self.count <= 64:
             raise LookupError("boss work looks uninitialised (parts=%d)" % self.count)
@@ -44,6 +60,31 @@ class Boss:
         shift = self.defs & 7
         self.ids = [struct.unpack_from("<I", raw, shift + 0x58 * i)[0] & 0x3F0 for i in range(self.count)]
         self.max = [struct.unpack_from("<f", raw, shift + 0x58 * i + 0x1C)[0] for i in range(self.count)]
+
+    def life(self):
+        """(current life, maximum life, dead flag)."""
+        cur, mx, dead = self.p.read32_many([self.base + 0x44, self.base + 0x40, self.base + 0xEC])
+        f = lambda w: struct.unpack("<f", struct.pack("<I", w))[0]
+        return f(cur), f(mx), dead
+
+    def merge_life(self, remote):
+        """Lower the local life to the remote one (life only goes down); a remote 0 kills the colossus here
+        through the game's own death path. Returns True when the local life changed."""
+        cur, _mx, _dead = self.life()
+        if 0.0 <= remote < cur:
+            self.p.writef(self.base + 0x44, max(0.0, remote))
+            return True
+        return False
+
+    def kill(self):
+        """Kill the colossus the way the game's own killing blow does (see the module notes). Call it outside
+        cutscenes: a colossus killed while its intro plays leaves the intro waiting forever."""
+        p = self.p
+        p.writef(self.base + 0x44, 0.0)
+        layout = call(p, GET_LAYOUT_CLASS, self.obj)
+        p.write32(layout + 0x1AC, 1)
+        p.write32(PLAYER_ENABLE_DEATH, 0)
+        call(p, SCRIPT_INTR_SIGNAL, p.read32(SCR_INTR_DEAD_BOSS))
 
     def damage_addr(self, i):
         return self.block + 0x24 + 8 * i
@@ -72,7 +113,8 @@ class Boss:
 def show(p):
     boss = Boss(p)
     motion, table, frame, pos = boss.pose()
-    print("boss 0x%08x pos (%.1f, %.1f, %.1f) motion 0x%08x table 0x%08x frame %.1f" % (boss.obj, *pos, motion, table, frame))
+    print("boss 0x%08x pos (%.1f, %.1f, %.1f) motion 0x%08x table 0x%08x frame %.1f life %.1f / %.1f dead %d" % (
+        boss.obj, *pos, motion, table, frame, *boss.life()))
     for i, (dmg, mx) in enumerate(zip(boss.read_damage(), boss.max)):
         print("  part %2d id %#05x damage %8.2f / %8.2f" % (i, boss.ids[i], dmg, mx))
 

@@ -26,6 +26,16 @@ GRAPH_FRAME_FINISH = 0x01189C58
 DEBUG_SET_OBJECT_GEOMETRY = 0x01341218
 
 # Free EE RAM (zero in every snapshot, title screen through gameplay).
+# Mailbox map (offsets from MAILBOX; keep it current, three overlaps already cost freezes):
+#   0x000-0x06F hook commands          0x070-0x0EF spawn: Wander clone pointers (4 x 0x20)
+#   0x100-0x11B pad override, frame cb 0x120-0x15F spawn: horse clone pointers (4 x 0x10)
+#   0x180-0x18F guard / spawn counters 0x1A0-0x1AB bosssync counters
+#   0x200-0x3FF puppet state blocks (8 x 0x40)
+#   0x470-0x4EF, 0x520-0x55F  guard: original delete handlers (pointer word + 0x400)
+#   0x600-0x60F warp.py scratch        0x700-0x713 barrier.py
+#   0x870-0x8EF, 0x920-0x95F  guard: layout definitions (pointer word + 0x800)
+#   0x9F0       scratch                0xA00-0xA7F probe.py counters
+#   0xB00-0xB3F bosssync state block
 MAILBOX = 0x000F8000
 MB_FRAME, MB_CMD, MB_OBJ, MB_QUAT, MB_POS, MB_DONE, MB_DRAW = 0x00, 0x04, 0x08, 0x10, 0x20, 0x30, 0x34
 # Generic call: CMD=2 calls MB_FN(a0..a3, t0, t1) from MB_ARGS and stores v0 in MB_RET.

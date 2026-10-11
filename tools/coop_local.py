@@ -84,17 +84,18 @@ def connect(slot, timeout=90.0):
 
 
 def load_clean_state(name):
+    slot = int(os.environ.get("STATE_SLOT_" + name.upper(), STATE_SLOT))   # e.g. STATE_SLOT_A=1 STATE_SLOT_B=2
     state_dir = os.path.join(ROOT, "work", "pcsx2_" + name, "savestates")
     os.makedirs(state_dir, exist_ok=True)
-    target = os.path.join(state_dir, "SCUS-97472 (C19A374E).%02d.p2s" % STATE_SLOT)
+    target = os.path.join(state_dir, "SCUS-97472 (C19A374E).%02d.p2s" % slot)
     if not os.path.exists(target):
-        donor = os.path.join(ROOT, "work", "pcsx2_a", "savestates", "SCUS-97472 (C19A374E).%02d.p2s" % STATE_SLOT)
+        donor = os.path.join(ROOT, "work", "pcsx2_a", "savestates", "SCUS-97472 (C19A374E).%02d.p2s" % slot)
         if not os.path.exists(donor):
             raise SystemExit("no clean state: reach the shrine once in instance A and save slot 1")
         shutil.copyfile(donor, target)
     p = connect(SLOTS[name])
     time.sleep(8.0)                     # the game must be running before a state can be loaded
-    p.load_state(STATE_SLOT)
+    p.load_state(slot)
     time.sleep(4.0)
     p.close()
 
@@ -130,7 +131,7 @@ def main():
             "a": open(os.path.join(ROOT, "work", "net_a_win.log"), "w")}
     def bridge_env(name):
         extra = {"PINE_SLOT": str(SLOTS[name])}
-        for key in ("DEBUG_DAMAGE_AT", "DEBUG_KILL_EVERY"):
+        for key in ("DEBUG_DAMAGE_AT", "DEBUG_KILL_EVERY", "DEBUG_KILL_BOSS_AT", "PULL"):
             if os.environ.get(key + "_" + name.upper()):
                 extra[key] = os.environ[key + "_" + name.upper()]
         if os.environ.get("SCENARIO_" + name.upper()):          # scripted controller for this instance

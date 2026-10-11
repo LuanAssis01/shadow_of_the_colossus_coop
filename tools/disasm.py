@@ -1,6 +1,7 @@
 """Minimal R5900 disassembler for live RAM, with recovered symbol names.
 
   python3 disasm.py ADDR|NAME [COUNT]
+  env RAM=eeMemory.bin   read a RAM image (e.g. from a savestate) instead of the live emulator
 """
 import bisect
 import os
@@ -62,6 +63,8 @@ def decode(addr, w, names):
         return "%s %s,%s,0x%08x" % ({4: "beq", 5: "bne", 0x14: "beql", 0x15: "bnel"}[op], REG[rs], REG[rt], t)
     if op in (6, 7):
         return "%s %s,0x%08x" % ("blez" if op == 6 else "bgtz", REG[rs], addr + 4 + (s16(imm) << 2))
+    if op == 1 and rt in (0, 1):
+        return "%s %s,0x%08x" % ("bltz" if rt == 0 else "bgez", REG[rs], addr + 4 + (s16(imm) << 2))
     if op == 1:
         return "regimm.%d %s,0x%08x" % (rt, REG[rs], addr + 4 + (s16(imm) << 2))
     if op == 0x0F:
@@ -87,9 +90,23 @@ def disasm(p, start, count, names):
         print("  %08x  %08x  %s" % (a, w, decode(a, w, names)))
 
 
+class RamFile:
+    """read_block() over a 32 MiB EE RAM image, so disasm() works offline."""
+
+    def __init__(self, path):
+        self.ram = open(path, "rb").read()
+
+    def read_block(self, addr, length):
+        addr &= 0x1FFFFFF
+        return self.ram[addr:addr + length]
+
+    def read32(self, addr):
+        return struct.unpack_from("<I", self.ram, addr & 0x1FFFFFF)[0]
+
+
 if __name__ == "__main__":
     syms = load_symbols()
     by_name = {v: k for k, v in syms.items()}
     target = sys.argv[1]
     start = by_name[target] if target in by_name else int(target, 16)
-    disasm(Pine(), start, int(sys.argv[2]) if len(sys.argv) > 2 else 40, syms)
+    disasm(RamFile(os.environ["RAM"]) if "RAM" in os.environ else Pine(), start, int(sys.argv[2]) if len(sys.argv) > 2 else 40, syms)

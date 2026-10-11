@@ -7,6 +7,8 @@
 !tools/*.py
 !tools/dec.sh
 !tools/rea-ps2
+!tools/ghidra_scripts/
+!tools/ghidra_scripts/*.java
 !work/scen*.json
 !work/walk*.bin
 

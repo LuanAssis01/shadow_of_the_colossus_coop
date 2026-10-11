@@ -19,7 +19,8 @@ from mips import Asm
 FUNCTION = 0x01349AD8            # bossStatStartDemo
 SCR_RUN = 0x013CF9E8
 DETOUR = 0x000F6C00
-MB_EN, MB_PENDING, MB_GO, MB_COUNT, MB_TIMEOUT = 0x200, 0x204, 0x208, 0x20C, 0x210
+# mailbox +0x200..+0x3FF holds the puppet state blocks (puppet.PUPPET_STATE): stay clear of them
+MB_EN, MB_PENDING, MB_GO, MB_COUNT, MB_TIMEOUT = 0x700, 0x704, 0x708, 0x70C, 0x710
 
 
 def j_to(t):

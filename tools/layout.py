@@ -3,6 +3,8 @@ import struct
 
 import numpy as np
 
+from heapgrow import in_heap
+
 NULL_SENTINEL_PTR = 0x001E0ED4  # *(0x1e0ed4) is the engine's "null handle block"
 GOBJ_DEF_TYPE = 0x01507738      # handle(entry+4)->+8 for spawnable game-object definitions
 
@@ -18,7 +20,7 @@ def handle_block(ram, p):
     if off == 0 or off > p:
         return 0
     base = u32(ram, p - off)
-    if base in (0, u32(ram, NULL_SENTINEL_PTR)) or not 0x100000 <= base < 0x2000000:
+    if base in (0, u32(ram, NULL_SENTINEL_PTR)) or not (0x100000 <= base < 0x2000000 or in_heap(base)):
         return 0
     return base
 
@@ -29,7 +31,7 @@ def find_entries(ram, obj):
     out = []
     for a in (np.nonzero(u == obj)[0] * 4).tolist():
         e = a - 0x48
-        if e < 0x100000:
+        if e < 0x100000 and not in_heap(e):
             continue
         blk = handle_block(ram, e + 4)
         if blk and u32(ram, blk + 8) == GOBJ_DEF_TYPE:

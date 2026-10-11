@@ -31,10 +31,11 @@ import struct
 import sys
 import time
 
-from hook import MAILBOX, SITES, install as install_hook, is_our_jal, counters
+from hook import MAILBOX, SITES, call, install as install_hook, is_our_jal, counters
 from pine import Pine, PineError
 import barrier
 import guard
+import heapgrow
 from pad import release as pad_release
 from pad import set_pad
 from puppet import HORSE_SLOT, MB_CLONES, clone_address, horse_address, make_puppet, write_state
@@ -46,11 +47,12 @@ PACKET = struct.Struct("<IIf3f4fI")
 HORSE = struct.Struct("<IIf3f4f")
 WIRE_SIZE = PACKET.size + HORSE.size
 # Also appended: the colossus of the sender's game (see bosssync.py). flags bit0 = a colossus is loaded, bit1 =
-# the pose is authoritative (only the host sets it); motion id, frame, position, rotation, part count, damage.
-BOSS = struct.Struct("<IIf3f4fI32f")
+# the pose is authoritative (only the host sets it); motion id, frame, position, rotation, part count, damage, life.
+BOSS = struct.Struct("<IIf3f4fI32ff")     # ... damage[32], life (base+0x44; -1 = unknown)
 FULL_SIZE = WIRE_SIZE + BOSS.size
 BOSS_PRESENT, BOSS_AUTH, BOSS_PENDING = 1, 2, 4   # PENDING: my game waits at the start of the encounter (barrier.py)
-BARRIER_SECONDS = float(os.environ.get("BOSS_BARRIER_SECONDS", "15"))
+# long enough for a far player to be pulled in (Puller: PULL_HOLD) and walk into the trigger
+BARRIER_SECONDS = float(os.environ.get("BOSS_BARRIER_SECONDS", "30"))
 _remote_pending = [0.0]       # last time the peer reported "waiting at the start of the encounter"
 _released_at = [0.0]
 _remote_running = [0.0]       # last time the peer reported its colossus running
@@ -74,7 +76,7 @@ def local_player(p):
 
 def valid_char(p, obj, kind):
     """True while obj still is a live character object of the given kind (stage reloads free them)."""
-    if not obj or obj & 3 or not 0x100000 <= obj < 0x2000000:
+    if not obj or obj & 3 or not heapgrow.in_heap(obj):
         return False
     try:
         word, k = p.read32_many([obj + 4, obj + CLASS + 0x370])
@@ -136,16 +138,17 @@ def read_local(p, player):
 
 
 NO_HORSE = HORSE.pack(0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
-NO_BOSS = BOSS.pack(0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0, *([0.0] * 32))
+NO_BOSS = BOSS.pack(0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0, *([0.0] * 32), -1.0)
 
 
 def pack_boss(boss, pending=False):
     if boss is None:
-        return BOSS.pack(BOSS_PENDING if pending else 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0, *([0.0] * 32))
-    mid, frame, pos, quat, damage, authoritative = boss
+        return BOSS.pack(BOSS_PENDING if pending else 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0, *([0.0] * 32), -1.0)
+    mid, frame, pos, quat, damage, authoritative, life = boss
+    count = min(len(damage), 32)
     damage = (list(damage) + [0.0] * 32)[:32]
     flags = BOSS_PRESENT | (BOSS_AUTH if authoritative else 0) | (BOSS_PENDING if pending else 0)
-    return BOSS.pack(flags, mid, frame, *pos, *quat, min(len(damage), 32), *damage)
+    return BOSS.pack(flags, mid, frame, *pos, *quat, count, *damage, life)
 
 
 def pack(seq, index, frame, pos, quat, horse=None, boss=None, pending=False):
@@ -167,6 +170,11 @@ def apply_boss(data, pid):
     if link is None or len(data) < FULL_SIZE:
         return
     flags, mid, frame, x, y, z, qx, qy, qz, qw, count, *damage = BOSS.unpack(data[WIRE_SIZE:FULL_SIZE])
+    damage, life = damage[:32], damage[32]
+    if flags & (BOSS_PENDING | BOSS_AUTH):
+        # the peer stands at a colossus (waiting at the encounter start, or fighting): where to pull me to
+        _, _, _, x0, y0, z0, qx0, qy0, qz0, qw0, _ = PACKET.unpack(data[:PACKET.size])
+        _pull_target[0] = (time.time(), (x0, y0, z0), (qx0, qy0, qz0, qw0))
     if flags & BOSS_PENDING:
         _remote_pending[0] = time.time()
     if flags & BOSS_AUTH:
@@ -174,12 +182,107 @@ def apply_boss(data, pid):
     if not flags & BOSS_PRESENT or link.refresh() is None:
         return
     link.merge_damage(damage[:min(count, 32)])
+    if life >= 0.0 and link.merge_life(life) and life <= 0.0:
+        print("the peer killed the colossus: killing it here too", flush=True)
     # whoever has the colossus running on its own AI is in charge; when both do, the host
     if flags & BOSS_AUTH and (not link.awake() or (BOSS_ROLE[0] == "client" and pid == 0)):
         seq = PACKET.unpack(data[:PACKET.size])[0]
         if seq > _boss_seq[0] or seq + 1000 < _boss_seq[0]:
             _boss_seq[0] = seq
             link.apply_pose(mid, frame, (x, y, z), (qx, qy, qz, qw))
+
+
+_pull_target = [None]          # (time, position, rotation) of a peer that is at a colossus
+
+
+class Puller:
+    """Bring me to the colossus the peer reached when I am far away (env PULL=0 disables it): to the colossus'
+    arrival point (where the game itself puts the horse when a fight starts), from where I walk into the arena.
+
+    The terrain around a far point streams in only while the player is near it, so the player (and the horse) is
+    held PULL_LIFT metres above the target for PULL_HOLD seconds - a teleport every 0.2 s, which also cancels the
+    fall - and then dropped next to the peer; the same trick as warp.py. It runs a step per bridge tick, so the
+    bridge keeps sending and receiving meanwhile. The encounter barrier (BOSS_BARRIER_SECONDS) keeps the peer's
+    intro waiting while I travel; once I land in the arena my own game reaches BootBoss and both start together."""
+
+    def __init__(self, p):
+        self.p, self.active, self.last_pull, self.next_hold = p, None, 0.0, 0.0
+
+    def tick(self, player, horse):
+        p, now = self.p, time.time()
+        if self.active:
+            end, pos, quat = self.active
+            if now >= end:
+                drop = (pos[0] + PULL_SIDE, pos[1] + 1.0, pos[2])
+                teleport_wait(p, player, drop, quat)
+                if horse:
+                    teleport_wait(p, horse, (drop[0] + 3.0, drop[1], drop[2]), quat)
+                # the game measures a fall from where it began (class+0x10B0): after the airborne hold that is
+                # 25 m up, and the 1 m drop killed the pulled player (tested); restart the fall where we are now
+                from hook import call as hook_call
+                for obj in (player, horse):
+                    if obj:
+                        hook_call(p, RESET_FALL_INFO, obj + CLASS)
+                print("pull done: dropped at (%.1f, %.1f, %.1f)" % drop, flush=True)
+                self.active = None
+            elif now >= self.next_hold:
+                self.next_hold = now + 0.2
+                teleport_wait(p, player, (pos[0] + PULL_SIDE, pos[1] + PULL_LIFT, pos[2]), quat)
+                if horse:
+                    teleport_wait(p, horse, (pos[0] + PULL_SIDE + 3.0, pos[1] + PULL_LIFT, pos[2]), quat)
+            return True
+        target = _pull_target[0]
+        if not PULL or target is None or now - target[0] > 1.0 or now - self.last_pull < PULL_COOLDOWN:
+            return False
+        if barrier.pending(p) or p.read32(GAME_MODE_BITS) & 1 or (BOSS_LINK[0] and BOSS_LINK[0].awake()):
+            return False                        # I am at my own encounter / in a cutscene or menu / fighting
+        x, z = p.readf(player + 0xA0), p.readf(player + 0xA8)
+        dist = ((x - target[1][0]) ** 2 + (z - target[1][2]) ** 2) ** 0.5
+        if dist < PULL_DISTANCE:
+            return False
+        # Not the peer's own spot: an arena behind its entrance is a stage segment the game loads when the player
+        # walks in, so a teleport there finds no floor (tested: 15 and 30 s holds, fell to the kill plane at
+        # y -300). The active colossus' arrival point streams in reliably (bosstour.py: all 16); walk in from it.
+        import warp
+        self.last_pull = now
+        try:
+            record = call(p, GET_ACTIVE_BOSS, timeout=1.0)
+            index = (record - p.read32(warp.BOSS_TABLE + 0x10)) // warp.BOSS_RECORD_SIZE if record else -1
+            if not 0 <= index < warp.BOSS_COUNT:
+                return False
+            dest, heading, _area, _hp, _grip = warp.arrival(p, index)
+        except TimeoutError:
+            return False
+        if ((dest[0] - target[1][0]) ** 2 + (dest[2] - target[1][2]) ** 2) ** 0.5 > PULL_PEER_RADIUS:
+            print("the peer is at a colossus %.0f m away, but not at my active colossus %d: no pull" % (dist, index),
+                  flush=True)
+            return False
+        print("the peer is at colossus %d, %.0f m away: pulling me to its arrival point (%.0f s hold while the "
+              "terrain loads)" % (index, dist, PULL_HOLD), flush=True)
+        self.active = (now + PULL_HOLD, (dest[0] - PULL_SIDE, dest[1], dest[2]), warp.heading_quat(heading))
+        return True
+
+
+PULL = os.environ.get("PULL", "1") != "0"
+PULL_DISTANCE = float(os.environ.get("PULL_DISTANCE", "150"))
+PULL_HOLD = float(os.environ.get("PULL_HOLD", "15"))
+PULL_LIFT = 25.0
+PULL_SIDE = 2.5
+PULL_COOLDOWN = 120.0
+GAME_MODE_BITS = 0x01465D70
+RESET_FALL_INFO = 0x011BB4B8      # ResetCharacterClassFallDownInfo(class): fall start = current position
+GET_ACTIVE_BOSS = 0x0134A4C0      # bossStatGetActiveBoss() -> boss record
+PULL_PEER_RADIUS = 400.0          # the peer must be this close to my active colossus' arrival point
+
+
+def teleport_wait(p, obj, pos, quat, timeout=0.5):
+    """hook.teleport, waiting until the hook has run it (the next hook.call would overwrite the command)."""
+    from hook import MB_DONE, teleport
+    done = p.read32(MAILBOX + MB_DONE)
+    teleport(p, obj, pos, quat)
+    end = time.time() + timeout
+    while p.read32(MAILBOX + MB_DONE) == done and time.time() < end:
+        time.sleep(0.005)
 
 
 TELEPORT_DISTANCE = float(__import__("os").environ.get("TELEPORT_DISTANCE", "5.0"))
@@ -418,6 +521,7 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
     mine = Local(p, player)
     gone_since = None
     tracer = Tracer(os.environ["TRACE"]) if "TRACE" in os.environ else None
+    puller = Puller(p) if BOSS_ROLE[0] and local is None else None
     if _debug_kill[0] is None and "DEBUG_KILL_EVERY" in os.environ:
         _debug_kill[0] = time.time() + float(os.environ["DEBUG_KILL_EVERY"])
     while True:
@@ -436,6 +540,13 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
             b = BOSS_LINK[0].boss
             p.writef(b.damage_addr(0), 5.0)
             print("DEBUG: local damage on part 0 set to 5.0", flush=True)
+        if "DEBUG_KILL_BOSS_AT" in os.environ and BOSS_LINK[0] and BOSS_LINK[0].boss and                 time.time() - _t_start > float(os.environ["DEBUG_KILL_BOSS_AT"]):
+            del os.environ["DEBUG_KILL_BOSS_AT"]        # test hook: the local player "kills" the colossus
+            if p.read32(0x01465D70) & 1:
+                os.environ["DEBUG_KILL_BOSS_AT"] = "0"   # in a cutscene: retry next tick
+            else:
+                BOSS_LINK[0].boss.kill()
+                print("DEBUG: local colossus killed", flush=True)
         if scenario:
             scenario.tick(p)
         if send is not None:
@@ -454,6 +565,8 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
                     gone_since = None
                     if "DEBUG_KILL_EVERY" in os.environ:
                         _debug_kill[0] = time.time() + float(os.environ["DEBUG_KILL_EVERY"])
+            if wander is not None and puller is not None:
+                puller.tick(mine.player, mine.horse)
             if wander is not None:
                 link = BOSS_LINK[0]
                 waiting = False
@@ -539,10 +652,10 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
                 import bosssync as _bs
                 cnt = p.read32_many([MAILBOX + _bs.MB_CALLS, MAILBOX + _bs.MB_TELEPORTS, MAILBOX + _bs.MB_MOVES])
                 tg = bl.last_target
-                bs = " | boss tgt %s" % ("(%.1f, %.1f)" % (tg[0], tg[2]) if tg else "-") + " calls/tp/mv %d/%d/%d" % tuple(cnt) + " %s%s motion %#x pos (%.1f, %.1f) damage %.1f" % (
+                bs = " | boss tgt %s" % ("(%.1f, %.1f)" % (tg[0], tg[2]) if tg else "-") + " calls/tp/mv %d/%d/%d" % tuple(cnt) + " %s%s motion %#x pos (%.1f, %.1f) damage %.1f life %.1f" % (
                     "AWAKE " if bl.awake() else "", "mirror " if bl.mirroring() else "",
                     (bl.prev or (0, 0, 0, 0))[3], (bl.prev or (0, 0, 0, 0))[0], (bl.prev or (0, 0, 0, 0))[2],
-                    sum(bl.boss.read_damage()))
+                    sum(bl.boss.read_damage()), bl.boss.life()[0])
             print("tick %d: %s | player (%.2f, %.2f) | heap free %d%s" % (
                 seq, " ; ".join(line), p.readf(mine.player + 0xA0), p.readf(mine.player + 0xA8), p.read32(HEAP_FREE), bs),
                 flush=True)
@@ -592,11 +705,14 @@ def world_settled(p):
     return load == 0xFFFFFFFF and pause == 0 and loading == 0
 
 
-def wait_world(p, stable=3.0, quiet=False):
+def wait_world(p, stable=3.0, quiet=False, end=None):
     """Block until the game is in a playable, stable state: the frame hook runs (installing it again if a
-    reload removed it), the local Wander is alive with HP > 0. Returns the player object."""
+    reload removed it), the local Wander is alive with HP > 0. Returns the player object (None once `end`, a
+    time.time() value, has passed: the session is over even if the world never came back)."""
     since, last, announced = None, None, False
     while True:
+        if end and time.time() > end:
+            return None
         player = None
         try:
             if not hooks_installed(p) or not _fresh_code[0]:
@@ -605,6 +721,11 @@ def wait_world(p, stable=3.0, quiet=False):
                 guard.install(p)
                 _fresh_code[0] = True
             if logic_running(p) and p.readf(PLAYER_HP) > 0 and world_settled(p):
+                # more heap for the clones (a colossus fight alone takes nearly all of it); a loaded savestate
+                # may predate the donation, so check every time the world is (re)entered
+                added = heapgrow.grow(p, quiet=True)
+                if added:
+                    print("heap grown by %d KB" % (added // 1024), flush=True)
                 player = local_player(p)
         except (PineError, StopIteration, SystemExit):
             player = None
@@ -682,8 +803,8 @@ def run_session(p, send, recv, duration, local, players):
     try:
         while True:
             try:
-                player = wait_world(p)
-                if end and time.time() > end:
+                player = wait_world(p, end=end)
+                if player is None or (end and time.time() > end):
                     return
                 despawn_clones(p)
                 setup_clones(p, max(1, players - 1))

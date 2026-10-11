@@ -3,6 +3,7 @@ import struct
 
 import numpy as np
 
+from heapgrow import in_heap
 from pine import Pine
 
 CHAR_CLASS = 0x01206DD8
@@ -14,7 +15,7 @@ def find_chars(p):
     b = np.frombuffer(ram, dtype=np.uint8)
     out = []
     for x in (np.nonzero(b[8::16] == 9)[0] * 16).tolist():
-        if x < 0x1000000 or x + 0xA00 > len(ram):
+        if not in_heap(x) or x + 0xA00 > len(ram):
             continue
         if struct.unpack_from("<I", ram, x + 4)[0] != CHAR_CLASS:
             continue
