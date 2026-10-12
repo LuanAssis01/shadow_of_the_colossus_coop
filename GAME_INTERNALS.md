@@ -212,6 +212,25 @@ alimentado por tabelas de funções com argumentos.)
   (marcas 0x103/0x203/0x303): a entrada 0x303 só vale se for do colosso ATIVO. Por isso `bossStatSetActiveBoss`
   mexe nas flags: ativa só o GObject do colosso escolhido e desliga os demais.
 
+## 14. HP, garra, dano e física (resumo; parte inferida pelos nomes, não decompilada a fundo)
+
+* **HP** (`setPlayerHp` 0x01358298, `addPlayerHp` 0x01358318): float em 0x012DE264, travado em 0..máximo
+  (fwork 0xB). Valores negativos passam pelo fator `gStatGetPlayerAccessoriesDamgeRaitoToPlayer` (dano recebido
+  varia com acessórios). Toda mudança atualiza as barras de UI (4 slots de 0x10 bytes em 0x012F2930, razão
+  HP/máx em 0x01466BB0..BB8, esmaecimento 0.1/quadro) e só anima se não houver cutscene/fade.
+  `addPlayerMaxHp` (teto 570) toca o som de upgrade.
+* **Dano ao jogador**: `SendDirectDamageLetter(valor, origem, alvo, geometria, tipo)` monta a carta; queda usa
+  `nico_SendPlayerFallDownDamageMail` (valor em `classe+0x51C`, tipo -3). Dificuldade via `SetDamageClassDamageTableType`.
+* **Física do personagem** (`charrootdyn_*` 84 funções, `motrootdyn_*` 31): colisão por "GP" (pontos de geometria):
+  deslizamento (`slidecollision`), pouso (`setLandingStatus`, `getLandingSurface`), queda livre
+  (`startfreefall`, `startmotionfall`), água (`checkUnderWater`, `getWaterStatus`), vento, bordas e paredes
+  escaláveis (`detectCharClimbableWall`, `checkHangableEdgeWall`, `detectCharEdge`).
+  **Pai geométrico**: `updateCharacterClassParentGeometry`, `getLocalOffsetFromParentGP`, `isParentToEdge`,
+  `motrootdyn_parent_from_falldown`: um personagem pode ficar "preso" a um ponto de geometria de outro objeto e
+  guardar a posição relativa a ele. É assim que o Wander acompanha o corpo em movimento do colosso ao escalar.
+  Consequência para o co-op: o clone não agarra nem sobe no colosso (não tem pai geométrico); fazê-lo exigiria
+  chamar essas rotinas (ainda não tentado).
+
 ## 10. Lacunas (ainda nÃ£o decompilado a fundo)
 
 * Os dados concretos das tabelas de IA de cada colosso (condições/ações por estado) e o motivo de 5 colossos não carregarem (seção 12).
