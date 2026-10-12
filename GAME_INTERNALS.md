@@ -191,9 +191,30 @@ alimentado por tabelas de funções com argumentos.)
   personagem tipo 4 em nenhum lugar da RAM. Próxima hipótese: o GObject desses nasce por um gatilho de evento/
   posição fora do ponto de chegada (o #4 já aparecia a 641 m dele). Ainda não testado.
 
+## 13. Carregamento de arquivos e GObjects
+
+* **Fila de carga** (`sheetMgr*`, 0x012574F0-0x012594B0): um thread de I/O consome pedidos de 0x30 bytes
+  (`[0]` tipo: 0 = carregar segmento, 1 = descarregar, 2 = dados de mapa; `+8` heap; `+0xC` segmento;
+  `+0x28` ponteiro de status, preenchido com 0xDEAD enquanto pendente e 0xDEAF/0xDEB0 ao concluir). Quem pede
+  (`stagemanager_loadstagecore`) espera em laço de `scrRun()` até o status mudar; 0xDEB0 = falhou/nada a instanciar.
+* **Tipos de arquivo** (`loadCd*File`, 0x011F6B40-0x011FC238): XFF (módulo de código/dados), NMO (modelo), NSO,
+  NTO (textura), NFB, movimento (`loadCdMotionFile`: arquivos de animação `anim/*.anb`), ColRes (colisão),
+  WinTex. Todos seguem o mesmo padrão: `iosMallocInGarbagePtn(tamanho, 0x10)` numa partição "de lixo" ->
+  `sheetFileRead` -> `isysCreateModuleObjExisted` (vira um objeto-módulo) -> `isysResolveOneModuleObj` (relocação por
+  símbolo) -> adicionado a um grupo do isys. Se a alocação falha, o pedido chama
+  `vschedSetNextFrameForceGarbage()` e espera (`sheetWait`) em laço até liberar memória: é o jeito do jogo
+  sobreviver à falta de RAM em carga de assets (diferente das alocações de objeto, que travam).
+* **GObject** (definição de objeto de jogo numa entrada de layout): `def+0x08` = id de flag de exibição,
+  `def+0x0C` = endereço do objeto instanciado (`gStatGetGObjAdrs/SetGObjAdrs`; é o "cache" que os filhos
+  procuram), `def+0x10` bit 0 = exibição ligada (`gStatGObjDispOn/Chk`), bit 1 = lógica invertida da flag
+  (`gStatGobjDispGflagChk`: spawna se a flag estiver ligada, ou desligada quando o bit 1 está setado).
+  `FUN_013600a8` só cria a entrada se `gStatGObjDispChk` = 1; `backStageGobjCheckEntry` filtra entradas de chefe
+  (marcas 0x103/0x203/0x303): a entrada 0x303 só vale se for do colosso ATIVO. Por isso `bossStatSetActiveBoss`
+  mexe nas flags: ativa só o GObject do colosso escolhido e desliga os demais.
+
 ## 10. Lacunas (ainda nÃ£o decompilado a fundo)
 
 * Os dados concretos das tabelas de IA de cada colosso (condições/ações por estado) e o motivo de 5 colossos não carregarem (seção 12).
 * Sistema de cutscenes (`demoManStart`, `SDemo*`), Ã¡udio, memory card, fÃ­sica `charrootdyn`/`motrootdyn`.
-* Formato dos arquivos (`sheetMgr*`, XFF/anb/lws) e do mapa do mundo (`SH_StageDataDEFAULT`).
+* Formato interno dos arquivos (XFF/anb/lws/NMO) e do mapa do mundo (`SH_StageDataDEFAULT`); só o fluxo de carga está documentado (seção 13).
 * Por que 5 colossos (7, 10, 13-15) nÃ£o aparecem ao teleportar (evento de spawn).
