@@ -231,6 +231,19 @@ alimentado por tabelas de funções com argumentos.)
   Consequência para o co-op: o clone não agarra nem sobe no colosso (não tem pai geométrico); fazê-lo exigiria
   chamar essas rotinas (ainda não tentado).
 
+## 15. Cutscenes de evento: onde começam (medido com probes)
+
+* Durante a intro do colosso 0 e a morte dele, `createScrEventDemoManager` (0x0145AF70, 11 argumentos, chamado pelo
+  script de evento em curso, cria um script-filho `scrDemoManager`) disparou 2 vezes na intro (duas sub-cenas) e
+  0 na morte; `demoManStart` 0 vezes e `SCRFuncStartEventDemo` só é consultado por quadro (condição). Ou seja:
+  `demoManStart` é das cenas de título/abertura; as cenas de evento usam `createScrEventDemoManager`; a morte do
+  colosso (`st_boss_dead`) conduz a própria câmera sem passar por ele.
+* `gameModeSet` roda centenas de vezes (menus, pausa, mapa): não serve de gancho para cutscene.
+* Co-op: `barrier.DEMO` (detour em `createScrEventDemoManager`, preserva a0-a3/t0-t3) segura a cena por até
+  `DEMO_BARRIER_SECONDS` (4 s) quando o par está a menos de `DEMO_NEAR` (150 m); libera quando o par também espera
+  uma cena, já está em cena (flag `IN_DEMO` = bit 0 do modo de jogo) ou seu colosso já luta. A morte do colosso
+  não passa por essa barreira (cada máquina toca a sua, disparadas pela vida sincronizada).
+
 ## 10. Lacunas (ainda nÃ£o decompilado a fundo)
 
 * Os dados concretos das tabelas de IA de cada colosso (condições/ações por estado) e o motivo de 5 colossos não carregarem (seção 12).

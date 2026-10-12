@@ -55,10 +55,18 @@ PROGRESS = struct.Struct("<if")
 NET_SIZE = FULL_SIZE + PROGRESS.size
 NO_PROGRESS = PROGRESS.pack(-1, 0.0)
 BOSS_PRESENT, BOSS_AUTH, BOSS_PENDING = 1, 2, 4   # PENDING: my game waits at the start of the encounter (barrier.py)
+DEMO_PENDING, IN_DEMO = 8, 16    # my game waits at the start of a cutscene (barrier.DEMO) / is in one (game mode bit 0)
 # long enough for a far player to be pulled in (Puller: PULL_HOLD) and walk into the trigger
 BARRIER_SECONDS = float(os.environ.get("BOSS_BARRIER_SECONDS", "30"))
 _remote_pending = [0.0]       # last time the peer reported "waiting at the start of the encounter"
 _released_at = [0.0]
+_remote_demo_pending = [0.0]  # last time the peer reported "waiting at the start of a cutscene"
+_remote_in_demo = [0.0]       # last time the peer reported being inside a cutscene
+_remote_pos = [None]          # (time, x, z) of the peer's Wander (cutscene barrier only waits for a nearby peer)
+DEMO_NEAR = float(os.environ.get("DEMO_NEAR", "150"))          # metres: closer than this = we share the cutscene
+DEMO_SECONDS = float(os.environ.get("DEMO_BARRIER_SECONDS", "4"))
+_demo_released_at = [0.0]
+_demo_was_waiting = [False]
 _remote_running = [0.0]       # last time the peer reported its colossus running
 BOSS_ROLE = [None]            # "host" | "client" | None (no colossus sync): set by main()
 BOSS_LINK = [None]
@@ -145,24 +153,24 @@ NO_HORSE = HORSE.pack(0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
 NO_BOSS = BOSS.pack(0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0, *([0.0] * 32), -1.0)
 
 
-def pack_boss(boss, pending=False):
+def pack_boss(boss, pending=False, extra=0):
     if boss is None:
-        return BOSS.pack(BOSS_PENDING if pending else 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0, *([0.0] * 32), -1.0)
+        return BOSS.pack((BOSS_PENDING if pending else 0) | extra, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0, *([0.0] * 32), -1.0)
     mid, frame, pos, quat, damage, authoritative, life = boss
     count = min(len(damage), 32)
     damage = (list(damage) + [0.0] * 32)[:32]
-    flags = BOSS_PRESENT | (BOSS_AUTH if authoritative else 0) | (BOSS_PENDING if pending else 0)
+    flags = BOSS_PRESENT | (BOSS_AUTH if authoritative else 0) | (BOSS_PENDING if pending else 0) | extra
     return BOSS.pack(flags, mid, frame, *pos, *quat, count, *damage, life)
 
 
-def pack(seq, index, frame, pos, quat, horse=None, boss=None, pending=False, progress=None):
+def pack(seq, index, frame, pos, quat, horse=None, boss=None, pending=False, progress=None, demo=0):
     wire = PACKET.pack(seq, index, frame, *pos, *quat, 0)
     if horse is None:
         wire += NO_HORSE
     else:
         h_index, h_frame, h_pos, h_quat = horse
         wire += HORSE.pack(HORSE_PRESENT, h_index, h_frame, *h_pos, *h_quat)
-    return wire + pack_boss(boss, pending) + (PROGRESS.pack(*progress) if progress else NO_PROGRESS)
+    return wire + pack_boss(boss, pending, demo) + (PROGRESS.pack(*progress) if progress else NO_PROGRESS)
 
 
 _boss_seq = [-1]
@@ -179,6 +187,12 @@ def apply_boss(data, pid):
         # the peer stands at a colossus (waiting at the encounter start, or fighting): where to pull me to
         _, _, _, x0, y0, z0, qx0, qy0, qz0, qw0, _ = PACKET.unpack(data[:PACKET.size])
         _pull_target[0] = (time.time(), (x0, y0, z0), (qx0, qy0, qz0, qw0))
+    _, _, _, px, _py, pz = PACKET.unpack(data[:PACKET.size])[:6]
+    _remote_pos[0] = (time.time(), px, pz)
+    if flags & DEMO_PENDING:
+        _remote_demo_pending[0] = time.time()
+    if flags & IN_DEMO:
+        _remote_in_demo[0] = time.time()
     if flags & BOSS_PENDING:
         _remote_pending[0] = time.time()
     if flags & BOSS_AUTH:
@@ -374,6 +388,35 @@ SETTLE_ERROR = float(__import__("os").environ.get("SETTLE_ERROR", "0.25"))
 SETTLE_PACKETS = 8          # target unmoved for this many packets (~0.27 s) counts as standing still
 _still = {}
 _last_target = {}
+
+
+def ago(t):
+    return "%.1fs ago" % (time.time() - t) if t else "never"
+
+
+def demo_barrier(p, my_pos):
+    """Cutscene barrier (barrier.DEMO, a detour on demoManStart): only worth waiting when the peer is near (it will
+    see the same scene); a far peer lets the scene start at once. A pending local wait is released when the peer is
+    also waiting for ITS cutscene or is already inside one. Returns the wire flags (DEMO_PENDING | IN_DEMO)."""
+    now = time.time()
+    pos = _remote_pos[0]
+    near = bool(pos and now - pos[0] < 2.0 and ((pos[1] - my_pos[0]) ** 2 + (pos[2] - my_pos[2]) ** 2) ** 0.5 < DEMO_NEAR)
+    waiting = barrier.DEMO.pending(p)
+    if waiting and not _demo_was_waiting[0]:
+        print("cutscene start: my game waits (peer near=%s, peer waiting %s, peer in a scene %s)" % (
+            near, ago(_remote_demo_pending[0]), ago(_remote_in_demo[0])), flush=True)
+    _demo_was_waiting[0] = waiting
+    ahead = now - _remote_running[0] < 1.0         # the peer's colossus already runs: it is past the intro, do not hold
+    if waiting and (not near or ahead or now - _remote_demo_pending[0] < 1.0 or now - _remote_in_demo[0] < 1.0):
+        barrier.DEMO.release(p)
+        if now - _demo_released_at[0] > 3.0:
+            print("cutscene start %s" % ("released together with the peer" if near else "not held: the peer is far"), flush=True)
+        _demo_released_at[0] = now
+    barrier.DEMO.set_enabled(p, near)
+    flags = DEMO_PENDING if waiting else 0
+    if p.read32(GAME_MODE_BITS) & 1:
+        flags |= IN_DEMO
+    return flags
 
 
 def apply_remote_horse(p, remotes, index, data):
@@ -658,8 +701,11 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
                         if time.time() - _released_at[0] > 3.0:
                             print("encounter start released together with the peer", flush=True)
                         _released_at[0] = time.time()
+                demo = 0
+                if link:
+                    demo = demo_barrier(p, wander[2])
                 send(pack(seq, *wander, horse=horse, boss=link.sample() if link else None, pending=waiting,
-                          progress=progress.tick() if progress else None))
+                          progress=progress.tick() if progress else None, demo=demo))
         for pid, data in recv():
             slot = remotes.slot_for(pid)
             if slot is None:
@@ -894,6 +940,7 @@ def run_session(p, send, recv, duration, local, players):
                 if BOSS_LINK[0] is not None:
                     BOSS_LINK[0].install()
                     barrier.install(p, int(BARRIER_SECONDS * 30))
+                    barrier.DEMO.install(p, int(DEMO_SECONDS * 30), enabled=False)
                 tick_loop(p, player, None, send, recv, (end - time.time()) if end else None, local, seq_box)
                 return
             except WorldLost as exc:
@@ -914,6 +961,7 @@ def run_session(p, send, recv, duration, local, players):
             if BOSS_LINK[0] is not None:
                 BOSS_LINK[0].uninstall()
                 barrier.uninstall(p)
+                barrier.DEMO.uninstall(p)
             despawn_clones(p)
             pad_release(p)
             print("bridge stopped: clones removed", flush=True)
