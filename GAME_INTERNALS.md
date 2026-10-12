@@ -188,8 +188,16 @@ alimentado por tabelas de funções com argumentos.)
   0x1007/0x5502 vs 0x3707, 0x2306...). Para os faltantes `bossStatBootChk` (0x0134A458) devolve -1 (o GObject em
   `record+0xE8` não está registrado) e o heap livre fica ~800-950 mil palavras (quase nada carregou). Esperar 150 s
   com o jogador parado no ponto de chegada não muda nada (não é demora de streaming), e não existe nenhum
-  personagem tipo 4 em nenhum lugar da RAM. Próxima hipótese: o GObject desses nasce por um gatilho de evento/
-  posição fora do ponto de chegada (o #4 já aparecia a 641 m dele). Ainda não testado.
+  personagem tipo 4 em nenhum lugar da RAM. Hipóteses testadas e REFUTADAS (2026-10-11):
+  * progresso: marcar os anteriores como mortos (`bossStatSetDeadBoss`) antes de ativar o 7 ou o 10: igual;
+  * distância: segurar o jogador no ar 10 s em 16 pontos (anéis de 300 e 700 m) ao redor do ponto de chegada do 7:
+    nenhum objeto tipo 4 aparece e o heap livre continua alto;
+  * flag de exibição (`record+0x24` -> entrada de `SH_GameObjectStatus`, `+0xC` = id da flag): fica limpa (=ativo) para o
+    colosso ativo e ligada nos demais, também para o 7: não é o discriminador.
+  Medido no colosso 0: sua entrada de layout está no segmento 0xD9 (e `record+0x38` = 0xDA, outro segmento); os valores
+  `record+0x38` dos outros (0x11D-0x12B) não são o segmento da arena. Mapear colosso -> segmento por `record+0xE8`
+  não funcionou (nenhuma entrada em RAM bate). Caminho prático que sobra: o jogador salvar um savestate dentro de
+  cada arena (os 5 faltantes) e usá-lo com `STATE_SLOT`; ou achar o gatilho lendo o script de evento da arena.
 
 ## 13. Carregamento de arquivos e GObjects
 
