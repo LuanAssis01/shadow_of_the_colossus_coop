@@ -142,6 +142,23 @@ Regenerar: `python tools/decompile.py import RAM.bin` (RAM de um savestate) e de
 * Sincronizar colosso = pose (movimento+frame+raiz) + vida; matar = sequÃªncia do golpe final; progresso = flags
   de colosso mortos + Ã­ndice ativo + HP mÃ¡x.
 
+## 11. Cutscenes (demo manager) — decompilado depois
+
+* Uma cutscene é um **objeto-script `demo_common`** (0x0140DEF0) com partição de heap própria (`iosCreatePartition`,
+  id 0x87) e um bloco de estado de 0x54 bytes apontado por `ScriptLayoutClass+0x2D8`. Layout do bloco: +0x00 estado
+  (6 = carregada), +0x04 pedido de boot, +0x08 boot concluído, +0x0C "iniciar", +0x10 "terminar", +0x20/+0x2C
+  ids de scripts de fim, +0x44 já começou, +0x48 id da cutscene, +0x4C/+0x50 progresso de carregamento.
+* API (todas só mexem nesse bloco; o trabalho real é feito pelo script `demo_common` que fica em laço `scrRun`):
+  `demoManBootRequest` (0x0140E330, liga o clipping próximo desligado e pede boot), `demoManBootChk`,
+  `demoManStart(obj, id)` (0x0140E390: grava o id e zera flags), `demoManChkStart` (+0x44 != 0),
+  `demoManChkLoadFinish`, `demoManEnd` (0x0140E400: cria scripts de fim, cancela legendas),
+  `demoManSkip` (0x0140E4F0: pula a câmera via `SkipCutDemoCameraOrient`).
+* `gameModeSet(mascara)` (0x01352B70) é **contado por referência**: o OR vai em `___gameMode` (0x01465D70) e cada bit
+  incrementa um byte em 0x012DA4F0+bit; `gameModeCls` decrementa e só limpa o bit no zero. Bit 0 = cutscene/menu.
+  Isso explica por que duas cutscenes aninhadas não soltam o modo cedo demais.
+* Para o co-op: o ponto limpo para uma barreira de cutscene genérica é `demoManStart` (id em +0x48 do bloco), igual ao
+  que `barrier.py` já faz em `bossStatStartDemo`; o fim é observável por `___gameMode & 1` voltar a 0.
+
 ## 10. Lacunas (ainda nÃ£o decompilado a fundo)
 
 * Interpretador de bytecode da IA (`updateScriptDataSystem`: tabela de opcodes) e os scripts de cada colosso.
