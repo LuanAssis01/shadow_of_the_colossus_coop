@@ -24,5 +24,25 @@ v1.00 build.
 - `tools/` Python tooling (PINE client, hook installer, spawner, puppet script, UDP bridge, stage guard, Windows launcher `coop_local.py`, helpers)
 - `work/scen*.json` input scenarios, `work/walk*.bin` recorded movement samples used by the tests
 
+## Before a co-op session
+
+The tools require Python 3 and `numpy`, plus your own PCSX2/PINE, Ghidra and REA setup described in
+[`MULTIPLAYER.md`](MULTIPLAYER.md). Run the read-only preflight against the selected PINE instance before
+starting a bridge:
+
+```sh
+python tools/doctor.py
+python tools/doctor.py --ready
+```
+
+The first command checks the expected game build, PINE and the shared mailbox map. `--ready` additionally
+requires installed, advancing frame hooks and a playable world. It never writes to the emulator.
+
+Pure-Python regression tests do not need PCSX2 or game assets:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
 This is an unofficial fan research project, not affiliated with or endorsed by Sony or the game's
 rights holders.

@@ -18,6 +18,7 @@ table = *(class + 0x2ac). Frame and rotation are plain floats.
 """
 import struct
 import time
+from typing import NamedTuple
 
 from boss import Boss
 from hook import MAILBOX, MB_FRAME_CB, MB_SAVED_SP, call
@@ -43,6 +44,23 @@ MOVE_DISTANCE = 1.0              # horizontal error that triggers a light move o
 MOVE_HEIGHT = 1.0
 JUMP_HEIGHT = 8.0
 JUMP_DISTANCE = 15.0             # error that triggers a full teleport (a cutscene moved the colossus)
+
+
+class BossSample(NamedTuple):
+    """Machine-independent state sent for a live colossus.
+
+    Keeping this named prevents diagnostic callers from silently drifting when a
+    field is added to the wire/state contract.  It remains tuple-compatible for
+    ``netbridge.pack_boss()``, which deliberately unpacks it positionally.
+    """
+
+    motion: int
+    frame: float
+    pos: tuple
+    quat: tuple
+    damage: tuple
+    authoritative: bool
+    life: float
 
 
 def count(a, offset):
@@ -221,7 +239,7 @@ class BossLink:
 
     # --- local -> wire ---------------------------------------------------------------------------------
     def sample(self):
-        """(motion id, frame, pos, quat, damage list, awake, life) of the local colossus, or None."""
+        """A :class:`BossSample` of the local colossus, or ``None`` when absent."""
         boss = self.refresh()
         if boss is None:
             return None
@@ -237,7 +255,7 @@ class BossLink:
             if pm != mid or abs(px - x) + abs(pz - z) > 0.05:
                 self.last_change = now
         self.prev = (x, y, z, mid)
-        return mid, f32(frame), (x, y, z), quat, boss.read_damage(), self.awake(), boss.life()[0]
+        return BossSample(mid, f32(frame), (x, y, z), quat, tuple(boss.read_damage()), self.awake(), boss.life()[0])
 
     # --- wire -> local ---------------------------------------------------------------------------------
     def apply_pose(self, mid, frame, pos, quat, blend=6.0):

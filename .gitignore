@@ -10,6 +10,8 @@
 !tools/rea-ps2
 !tools/gscripts/
 !tools/gscripts/*.java
+!tests/
+!tests/*.py
 !work/scen*.json
 !work/walk*.bin
 

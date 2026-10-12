@@ -48,9 +48,9 @@ while time.time() - t0 < sec:
     s = link.sample()
     rec.append((time.time() - t0, s))
     time.sleep(1 / 30)
-print("recorded %d samples; damage at the end %s" % (len(rec), [round(d, 1) for d in rec[-1][1][4]][:6]))
-moves = {s[0] for _t, s in rec if s}
-print("distinct motions", len(moves), "first/last pos", [round(v, 1) for v in rec[0][1][2]], [round(v, 1) for v in rec[-1][1][2]])
+print("recorded %d samples; damage at the end %s" % (len(rec), [round(d, 1) for d in rec[-1][1].damage][:6]))
+moves = {s.motion for _t, s in rec if s}
+print("distinct motions", len(moves), "first/last pos", [round(v, 1) for v in rec[0][1].pos], [round(v, 1) for v in rec[-1][1].pos])
 
 fresh()
 wake()
@@ -64,15 +64,15 @@ while True:
         break
     while i + 1 < len(rec) and rec[i + 1][0] <= now:
         i += 1
-    mid, frame, pos, quat, _dmg, _awake = rec[i][1]
-    pos = (pos[0] + DX, pos[1], pos[2] + DZ)
-    link.apply_pose(mid, frame, pos, quat)
+    sample = rec[i][1]
+    pos = (sample.pos[0] + DX, sample.pos[1], sample.pos[2] + DZ)
+    link.apply_pose(sample.motion, sample.frame, pos, sample.quat)
     time.sleep(1 / 30)
     cur = link.sample()
     if cur:
         n += 1
         err_pos.append(((cur[2][0] - pos[0]) ** 2 + (cur[2][2] - pos[2]) ** 2) ** 0.5)
-        err_motion += cur[0] != mid
+        err_motion += cur.motion != sample.motion
 link.uninstall()
 err_pos.sort()
 print("replay: %d ticks, position error mean %.2f p95 %.2f max %.2f, motion differs in %d%% of ticks" % (
