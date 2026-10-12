@@ -159,9 +159,41 @@ Regenerar: `python tools/decompile.py import RAM.bin` (RAM de um savestate) e de
 * Para o co-op: o ponto limpo para uma barreira de cutscene genérica é `demoManStart` (id em +0x48 do bloco), igual ao
   que `barrier.py` já faz em `bossStatStartDemo`; o fim é observável por `___gameMode & 1` voltar a 0.
 
+## 12. IA dos colossos: é dirigida por dados, não bytecode
+
+(Correção da seção 7: `updateScriptDataSystem` 0x01453E48 não interpreta bytecode; é um controlador por tipo,
+alimentado por tabelas de funções com argumentos.)
+
+* `work = GetSCRCharaAIWorkPtr(obj)`; `work+0x4090` = tipo do controlador: 0 pernas rápidas (`updateFastLegCtrlWork`),
+  1 pernas lentas, 2 pássaro (`updateBirdCtrlWork`), 3 minhoca/serpente (`updateWormCtrlWork`), 4 lento+pássaro,
+  6 outro, 7 cavalo. Estado em `work+0x3D10` (+0x3DC0 para a parte de pássaro). Alvo = jogador
+  (`SCRGetFirstObj(0x01465940)`, guardado em `work+0x4078`). Por quadro também: `updatePerceptionWork` (visão/
+  audição), `updateAngryWork` (raiva), `updateEyeWork`, `updateArrowThrustWork`, `updateHintWork`, `setSCRGazeStatus`.
+* **Raiva** = float em `work+0x40F8`, limitado a 0..100: decai por quadro quando não está tomando dano e sobe ao
+  levar golpe, conforme o tipo de dano (`DamageClass+0x60`: 0/5 usa parâmetro +8, 1/2/3/4 usa +4).
+* **Tabelas de comportamento**: o estado atual é um registro (`work+0x409c`) que aponta parâmetros de movimento
+  (`work+0x40A0`) copiados para os controladores (`setDashFastLegCtrlWork`, `setBackFastLegCtrlWork`,
+  `setRunStopTurnFastLegCtrlWork`, `setAttainModePathWork`...) e listas de ações e condições:
+  * **ação** (`execSCRBaseFunc` 0x01455FE8): lista de registros de 0x40 bytes `{função, arg...}` terminada em
+    função nula; chama cada função com os argumentos do registro.
+  * **condição** (`execCondition` 0x01455AE0): registros de 0x50 bytes `{modo, esperado, função, args...}`; modo 1 =
+    todas devem retornar o esperado (E), modo 2 = qualquer uma (OU); encadeia até o próximo ponteiro nulo.
+  As funções apontadas são os comandos `SCR*` (592 deles) e os dados vêm dos módulos (`SH_*`), por isso a IA de
+  cada colosso é um conjunto de tabelas relocáveis, não código.
+
+### Colossos que não aparecem ao teleportar (7, 10, 13, 14, 15) — resultado negativo
+
+* Dump dos 16 registros (`+0x50` flags, `+0x51` área, `+0x1C` flag de boot, `+0x24` GObject, `+0x34/+0x38`
+  segmentos, `+0xB0`, `+0xE8`): nenhum campo separa os 5 que faltam dos 11 que carregam (flags 0x4207/0x0F07/0x1607/
+  0x1007/0x5502 vs 0x3707, 0x2306...). Para os faltantes `bossStatBootChk` (0x0134A458) devolve -1 (o GObject em
+  `record+0xE8` não está registrado) e o heap livre fica ~800-950 mil palavras (quase nada carregou). Esperar 150 s
+  com o jogador parado no ponto de chegada não muda nada (não é demora de streaming), e não existe nenhum
+  personagem tipo 4 em nenhum lugar da RAM. Próxima hipótese: o GObject desses nasce por um gatilho de evento/
+  posição fora do ponto de chegada (o #4 já aparecia a 641 m dele). Ainda não testado.
+
 ## 10. Lacunas (ainda nÃ£o decompilado a fundo)
 
-* Interpretador de bytecode da IA (`updateScriptDataSystem`: tabela de opcodes) e os scripts de cada colosso.
+* Os dados concretos das tabelas de IA de cada colosso (condições/ações por estado) e o motivo de 5 colossos não carregarem (seção 12).
 * Sistema de cutscenes (`demoManStart`, `SDemo*`), Ã¡udio, memory card, fÃ­sica `charrootdyn`/`motrootdyn`.
 * Formato dos arquivos (`sheetMgr*`, XFF/anb/lws) e do mapa do mundo (`SH_StageDataDEFAULT`).
 * Por que 5 colossos (7, 10, 13-15) nÃ£o aparecem ao teleportar (evento de spawn).
