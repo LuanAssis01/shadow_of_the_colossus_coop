@@ -40,6 +40,45 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len(wire), netbridge.NET_SIZE)
         self.assertEqual(netbridge.PROGRESS.unpack(wire[netbridge.FULL_SIZE:]), (-1, 0.0))
 
+    def test_udp_envelope_round_trips_and_legacy_payload_stays_accepted(self):
+        payload = netbridge.pack(42, 5, 6.5, (1.0, 2.0, 3.0), (0.0, 0.0, 0.0, 1.0))
+        framed = netbridge.wrap_datagram(payload)
+
+        self.assertEqual(len(framed), len(payload) + netbridge.DATAGRAM_HEADER.size)
+        self.assertEqual(netbridge.unwrap_datagram(framed), payload)
+        self.assertEqual(netbridge.unwrap_datagram(payload), payload)
+
+    def test_unknown_envelope_version_is_rejected(self):
+        payload = b"state"
+        framed = netbridge.DATAGRAM_HEADER.pack(netbridge.DATAGRAM_MAGIC, 99, 0, len(payload)) + payload
+
+        with self.assertRaises(netbridge.WireProtocolError):
+            netbridge.unwrap_datagram(framed)
+
+    def test_jitter_buffer_waits_then_delivers_samples_in_sequence(self):
+        def sample(seq):
+            return netbridge.pack(seq, 0, 0.0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+
+        buffer = netbridge.RemoteJitterBuffer(delay=0.1)
+        first, second = sample(10), sample(11)
+        self.assertTrue(buffer.push(first, received=0.0))
+        self.assertTrue(buffer.push(second, received=0.02))
+        self.assertIsNone(buffer.pop(now=0.09))
+        self.assertEqual(buffer.pop(now=0.10), first)
+        self.assertEqual(buffer.pop(now=0.13), second)
+        self.assertFalse(buffer.push(first, received=0.13))
+
+    def test_jitter_buffer_discards_a_previous_sender_incarnation(self):
+        def sample(seq):
+            return netbridge.pack(seq, 0, 0.0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+
+        buffer = netbridge.RemoteJitterBuffer(delay=0.0)
+        old, restarted = sample(5000), sample(0)
+        buffer.push(old, received=0.0)
+        self.assertEqual(buffer.pop(now=0.0), old)
+        self.assertTrue(buffer.push(restarted, received=0.1))
+        self.assertEqual(buffer.pop(now=0.1), restarted)
+
 
 if __name__ == "__main__":
     unittest.main()

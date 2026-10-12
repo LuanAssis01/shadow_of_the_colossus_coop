@@ -15,13 +15,17 @@
   python3 netbridge.py join HOST PORT      connect to a host and exchange state
 
 Needs the hook, a spawned clone and its puppet script (hook.py install, spawn.py,
-puppet.py). A state packet is 44 bytes, 30 per second:
+puppet.py). A state payload is 44 bytes, 30 per second:
   seq u32 | motion u32 | frame f32 | pos 3f | quat 4f | pid u32
 `pid` identifies the player the state belongs to (0 = the host, k = the k-th client); clients leave
 it 0 and the host stamps it when relaying, so every machine can keep one clone per remote player.
 `motion` is the index of the current motion in the character's motion table
 (class+0x2ac, 0xdc bytes per entry), which is stable across machines, unlike heap
 addresses; 0xFFFFFFFF means "not in the table" and leaves the puppet's motion alone.
+
+UDP datagrams prepend an 8-byte ``SOTC`` v1 envelope containing the payload length. Receivers still
+accept old unenveloped payloads used by existing recordings and test tools; malformed or unknown-version
+envelopes are dropped.
 """
 import json
 import os
@@ -54,6 +58,9 @@ FULL_SIZE = WIRE_SIZE + BOSS.size
 PROGRESS = struct.Struct("<if")
 NET_SIZE = FULL_SIZE + PROGRESS.size
 NO_PROGRESS = PROGRESS.pack(-1, 0.0)
+DATAGRAM_MAGIC = b"SOTC"
+DATAGRAM_VERSION = 1
+DATAGRAM_HEADER = struct.Struct("<4sBBH")  # magic, version, flags (reserved), payload length
 BOSS_PRESENT, BOSS_AUTH, BOSS_PENDING = 1, 2, 4   # PENDING: my game waits at the start of the encounter (barrier.py)
 DEMO_PENDING, IN_DEMO = 8, 16    # my game waits at the start of a cutscene (barrier.DEMO) / is in one (game mode bit 0)
 # long enough for a far player to be pulled in (Puller: PULL_HOLD) and walk into the trigger
@@ -77,6 +84,37 @@ HEAP_FREE = 0x001E0BF0    # free bytes of the game's main heap (~380 KB at the s
 MOTION_STRIDE = 0xDC
 MOTION_TABLE_MAX = 4096
 CLASS = 0x90
+
+
+class WireProtocolError(ValueError):
+    """A datagram has our framing but not a version/length this bridge understands."""
+
+
+def wrap_datagram(payload):
+    """Add the versioned UDP envelope around a bridge payload."""
+    if len(payload) > 0xFFFF:
+        raise ValueError("bridge payload is too large for the UDP envelope")
+    return DATAGRAM_HEADER.pack(DATAGRAM_MAGIC, DATAGRAM_VERSION, 0, len(payload)) + payload
+
+
+def unwrap_datagram(datagram):
+    """Return a framed payload, accepting pre-envelope packets during upgrades."""
+    if not datagram.startswith(DATAGRAM_MAGIC):
+        return datagram
+    if len(datagram) < DATAGRAM_HEADER.size:
+        raise WireProtocolError("truncated UDP envelope")
+    magic, version, flags, length = DATAGRAM_HEADER.unpack_from(datagram)
+    if magic != DATAGRAM_MAGIC or version != DATAGRAM_VERSION or flags != 0:
+        raise WireProtocolError("unsupported UDP envelope version or flags")
+    payload = datagram[DATAGRAM_HEADER.size:]
+    if len(payload) != length:
+        raise WireProtocolError("UDP envelope length does not match datagram")
+    return payload
+
+
+def sequence_is_newer(seq, previous):
+    """The bridge's restart-tolerant sequence ordering (also used by its jitter buffer)."""
+    return previous is None or seq > previous or seq + 1000 < previous
 
 
 def local_player(p):
@@ -453,7 +491,7 @@ def apply_remote(p, clone, data, slot=0):
     """Publish a remote sample: the first one (or a big discontinuity) teleports, drift is fixed with
     light moves, everything else is just the per-frame pose / animation."""
     seq, index, frame, x, y, z, qx, qy, qz, qw, _pad = PACKET.unpack(data)
-    if seq <= _last_seq.get(clone, -1) and seq + 1000 > _last_seq.get(clone, -1):
+    if not sequence_is_newer(seq, _last_seq.get(clone)):
         return  # old or duplicate datagram (small tolerance lets a restarted sender through)
     _last_seq[clone] = seq
     table = p.read32(clone + CLASS + 0x2AC)
@@ -489,6 +527,7 @@ def apply_remote(p, clone, data, slot=0):
 
 DISCONNECT_SECONDS = float(os.environ.get("DISCONNECT_SECONDS", "3.0"))
 PARK_HEIGHT = 3000.0   # far above the world: the engine skips its geometry, nothing is drawn or collided
+REMOTE_JITTER_SECONDS = max(0.0, float(os.environ.get("REMOTE_JITTER_SECONDS", "0.10")))
 
 
 def park(p, clone, slot=0):
@@ -504,6 +543,50 @@ def park(p, clone, slot=0):
     _last_teleport.pop(clone, None)
     _last_target.pop(clone, None)
     _still.pop(clone, None)
+
+
+class RemoteJitterBuffer:
+    """Deliver the newest mature UDP sample after a short, fixed delay.
+
+    UDP may deliver a sample late or out of order. Applying it immediately can
+    move the puppet backwards for one tick. Holding samples for a small window
+    lets a later sequence supersede them, while still accepting the bridge's
+    established ``seq=0`` sender-restart convention. A zero-second window keeps
+    the old immediate behaviour for diagnosis.
+    """
+
+    def __init__(self, delay=REMOTE_JITTER_SECONDS):
+        self.delay = max(0.0, delay)
+        self.pending = {}
+        self.last_released = None
+
+    def push(self, data, received=None):
+        seq = PACKET.unpack_from(data)[0]
+        if not sequence_is_newer(seq, self.last_released):
+            return False
+        if self.last_released is not None and seq + 1000 < self.last_released:
+            # The sender restarted. Pending high sequence numbers belong to its
+            # previous incarnation and must never be applied afterwards.
+            self.pending.clear()
+        if seq in self.pending:
+            return False
+        self.pending[seq] = (time.time() if received is None else received, data)
+        return True
+
+    def pop(self, now=None):
+        """Return one mature packet, coalescing older mature samples, or ``None``."""
+        now = time.time() if now is None else now
+        mature = [(seq, item) for seq, item in self.pending.items() if item[0] + self.delay <= now]
+        if not mature:
+            return None
+        seq, (_received, data) = mature[0]
+        for candidate_seq, candidate in mature[1:]:
+            if sequence_is_newer(candidate_seq, seq):
+                seq, (_received, data) = candidate_seq, candidate
+        self.last_released = seq
+        self.pending = {pending_seq: item for pending_seq, item in self.pending.items()
+                        if sequence_is_newer(pending_seq, seq)}
+        return data
 
 
 class Remotes:
@@ -632,6 +715,7 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
     next_tick = time.time()
     scenario = Scenario(os.environ["SCENARIO"]) if "SCENARIO" in os.environ else None
     remotes = Remotes(p)
+    buffers = {}
     mine = Local(p, player)
     gone_since = None
     tracer = Tracer(os.environ["TRACE"]) if "TRACE" in os.environ else None
@@ -710,16 +794,25 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
             slot = remotes.slot_for(pid)
             if slot is None:
                 continue
-            index, obj = slot
+            index, _obj = slot
             if pid in remotes.parked:
                 print("player %d back after %.1fs" % (pid, time.time() - remotes.last_rx[pid]), flush=True)
                 remotes.parked.discard(pid)
-            apply_remote(p, obj, data[:PACKET.size], index)
-            apply_remote_horse(p, remotes, index, data)
+            buffers.setdefault(pid, RemoteJitterBuffer()).push(data)
             apply_boss(data, pid)
             if progress:
                 progress.observe(data)
             remotes.last_rx[pid] = time.time()
+        # Apply only mature remote player samples. World/boss state above remains
+        # prompt, while player/horse motion gains a small reordering window.
+        for pid, buffer in list(buffers.items()):
+            data = buffer.pop()
+            if data is None or pid not in remotes.by_pid:
+                continue
+            index = remotes.by_pid[pid]
+            obj = next(obj for slot, obj in remotes.slots if slot == index)
+            apply_remote(p, obj, data[:PACKET.size], index)
+            apply_remote_horse(p, remotes, index, data)
             if index == remotes.slots[0][0]:
                 target[0] = PACKET.unpack(data[:PACKET.size])
                 if tracer:
@@ -737,6 +830,7 @@ def tick_loop(p, player, clone, send, recv, duration=None, local=None, seq_box=N
                 remotes.parked.add(pid)
                 if index == remotes.slots[0][0]:
                     target[0] = None
+                buffers.pop(pid, None)
         seq += 1
         seq_box[0] = seq
         if seq % 10 == 0 and clone is None:
@@ -1035,11 +1129,11 @@ def sendfile(path, host, port, loss=0.0, jitter_ms=0.0):
             pending.append((start + i / RATE + random.uniform(0, jitter_ms) / 1000.0, PACKET.pack(*f) + NO_HORSE))
         now = time.time()
         for item in [x for x in pending if x[0] <= now]:
-            sock.sendto(item[1], (host, port))
+            sock.sendto(wrap_datagram(item[1]), (host, port))
             pending.remove(item)
         time.sleep(max(0.0, start + (i + 1) / RATE - time.time()))
     for _due, datagram in pending:
-        sock.sendto(datagram, (host, port))
+        sock.sendto(wrap_datagram(datagram), (host, port))
 
 
 def main():
@@ -1125,8 +1219,9 @@ def main():
         host_addr = (sys.argv[2], int(sys.argv[3]))
 
     def send(data):
+        datagram = wrap_datagram(data)
         for addr in (peers if server else [host_addr]):
-            sock.sendto(data, addr)          # the local player's own state (pid 0)
+            sock.sendto(datagram, addr)      # the local player's own state (pid 0)
 
     def recv():
         out = []
@@ -1135,6 +1230,10 @@ def main():
                 data, addr = sock.recvfrom(1024)
             except BlockingIOError:
                 return out
+            try:
+                data = unwrap_datagram(data)
+            except WireProtocolError:
+                continue
             if len(data) == PACKET.size:
                 data += NO_HORSE                              # sender without horse support
             if len(data) == WIRE_SIZE:
@@ -1152,7 +1251,7 @@ def main():
             data = PACKET.pack(*fields) + data[PACKET.size:]
             for other in peers:               # relay to every other peer
                 if other != addr:
-                    sock.sendto(data, other)
+                    sock.sendto(wrap_datagram(data), other)
             out.append((pid, data))
 
     duration = float(os.environ["DURATION"]) if "DURATION" in os.environ else None

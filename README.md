@@ -44,5 +44,7 @@ Pure-Python regression tests do not need PCSX2 or game assets:
 python -m unittest discover -s tests -v
 ```
 
+The UDP bridge uses a versioned `SOTC` v1 envelope and still reads existing raw recordings/test payloads.
+
 This is an unofficial fan research project, not affiliated with or endorsed by Sony or the game's
 rights holders.

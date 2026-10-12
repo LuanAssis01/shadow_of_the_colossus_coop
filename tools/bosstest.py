@@ -71,7 +71,7 @@ while True:
     cur = link.sample()
     if cur:
         n += 1
-        err_pos.append(((cur[2][0] - pos[0]) ** 2 + (cur[2][2] - pos[2]) ** 2) ** 0.5)
+        err_pos.append(((cur.pos[0] - pos[0]) ** 2 + (cur.pos[2] - pos[2]) ** 2) ** 0.5)
         err_motion += cur.motion != sample.motion
 link.uninstall()
 err_pos.sort()
